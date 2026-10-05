@@ -21,14 +21,17 @@ struct spa_pod;
 namespace NSROOT
 {
 
-class PipeWireWorker;
+class PipeWireLoop;
+class PipeWireDrain;
+struct PipeWireRuntime;
 
 void on_process(void* userdata);
 void on_param_changed(void* userdata, uint32_t id, const struct spa_pod* param);
 
 class PipeWireSource : public AudioSource
 {
-  friend class PipeWireWorker;
+  friend class PipeWireLoop;
+  friend class PipeWireDrain;
   friend void on_process(void* userdata);
   friend void on_param_changed(void* userdata, uint32_t id, const struct spa_pod* param);
 public:
@@ -53,7 +56,9 @@ private:
 
   void(*m_blankKiller)(void*, int, int);
 
-  PipeWireWorker* m_p;
+  PipeWireLoop* m_p;
+  PipeWireDrain* m_drain;
+  PipeWireRuntime* m_rt;
 };
 
 }

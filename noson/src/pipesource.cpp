@@ -2,6 +2,12 @@
  *      Copyright (C) 2026 Jean-Luc Barriere / bedasrv
  *
  *  PipeWire native low-latency capture source.
+ *
+ *  Threading mirrors upstream PASource: all blocking work (FLAC encode,
+ *  ringbuffer mutex, wakeups) runs in a normal-priority drain thread.
+ *  The PipeWire realtime process callback only memcpys PCM into a
+ *  lock-free spa_ringbuffer and signals an eventfd. Doing anything
+ *  heavier in the RT callback causes xruns (glitchy Sonos audio).
  */
 
 #include "pipesource.h"
@@ -12,17 +18,27 @@
 
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
+#include <spa/utils/ringbuffer.h>
 #include <spa/utils/result.h>
+
+#include <sys/eventfd.h>
 
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unistd.h>
+#include <errno.h>
 
 #define PW_DEFAULT_RATE      48000
 #define PW_DEFAULT_CHANNELS  2
 #define PW_DEFAULT_LATENCY   "256/48000"
+
+// PCM ring between RT callback and drain thread (power of two).
+// 256KB ~= 1.3s at S16LE 48k stereo; absorbs FLAC/HTTP stalls.
+#define PW_RING_SIZE         262144
+// Drain bite matches upstream PASource FRAME_BUFFER (256 frames).
+#define PW_DRAIN_FRAMES      256
 
 using namespace NSROOT;
 
@@ -37,26 +53,52 @@ struct PipeWireRuntime
   std::atomic<bool> negotiated;
   std::atomic<bool> streaming;
   PipeWireSource* source;
+  // lock-free PCM handoff (RT producer, drain consumer)
+  struct spa_ringbuffer ring;
+  char* ringmem;
+  int efd;
+  std::atomic<unsigned> dropped;
 };
 
-class PipeWireWorker : private OS::Thread
+class PipeWireLoop : private OS::Thread
 {
 public:
-  explicit PipeWireWorker(PipeWireSource* source);
-  virtual ~PipeWireWorker() override;
-
+  explicit PipeWireLoop(PipeWireSource* source, PipeWireRuntime* rt)
+  : OS::Thread(), m_source(source), m_rt(rt) { }
+  virtual ~PipeWireLoop() override
+  {
+    if (is_running())
+      stop_thread(true);
+  }
   bool isRunning() { return OS::Thread::is_running(); }
   void start() { OS::Thread::start_thread(true); }
   void requestInterruption() { OS::Thread::stop_thread(false); }
-  bool waitFinished(unsigned ms) { return OS::Thread::wait_thread(ms); }
   bool waitFinished() { return OS::Thread::wait_thread((unsigned)-1); }
-
-  PipeWireRuntime* rt() { return &m_rt; }
-
 private:
   void* process() override;
   PipeWireSource* m_source;
-  PipeWireRuntime m_rt;
+  PipeWireRuntime* m_rt;
+};
+
+class PipeWireDrain : private OS::Thread
+{
+public:
+  explicit PipeWireDrain(PipeWireSource* source, PipeWireRuntime* rt)
+  : OS::Thread(), m_source(source), m_rt(rt) { }
+  virtual ~PipeWireDrain() override
+  {
+    if (is_running())
+      stop_thread(true);
+  }
+  bool isRunning() { return OS::Thread::is_running(); }
+  void start() { OS::Thread::start_thread(true); }
+  void requestInterruption() { OS::Thread::stop_thread(false); }
+  bool waitFinished() { return OS::Thread::wait_thread((unsigned)-1); }
+private:
+  void* process() override;
+  void drainAvailable(char* buf, int bite, int channels);
+  PipeWireSource* m_source;
+  PipeWireRuntime* m_rt;
 };
 
 static const struct pw_stream_events stream_events = {
@@ -92,6 +134,28 @@ static std::string env_or(const char* key, const std::string& fallback)
   return fallback;
 }
 
+// RT-safe: copy PCM into the lock-free ring, drop newest on overflow.
+static void ring_write(PipeWireRuntime* rt, const char* data, uint32_t len)
+{
+  if (len == 0 || len >= PW_RING_SIZE)
+    return;
+  uint32_t idx = 0;
+  int32_t fill = spa_ringbuffer_get_write_index(&rt->ring, &idx);
+  uint32_t avail = (uint32_t)PW_RING_SIZE - (uint32_t)fill;
+  if (len > avail)
+  {
+    unsigned d = rt->dropped.fetch_add(1) + 1;
+    if ((d % 500) == 1)
+      DBG(DBG_WARN, "PipeWire: ring overrun, dropped %u chunks\n", d);
+    return;
+  }
+  spa_ringbuffer_write_data(&rt->ring, rt->ringmem, PW_RING_SIZE,
+                            idx & (PW_RING_SIZE - 1), data, len);
+  spa_ringbuffer_write_update(&rt->ring, idx + len);
+  uint64_t one = 1;
+  (void)write(rt->efd, &one, sizeof(one)); // EFD_NONBLOCK: never blocks
+}
+
 }
 
 PipeWireSource::PipeWireSource(const std::string& name, const std::string& target)
@@ -101,7 +165,8 @@ PipeWireSource::PipeWireSource(const std::string& name, const std::string& targe
 , m_format()
 , m_output(nullptr)
 , m_blankKiller(&PCMBlankKillerS16LE)
-, m_p(new PipeWireWorker(this))
+, m_p(nullptr)
+, m_drain(nullptr)
 {
   // Fixed low-latency friendly format: S16LE 48k stereo. PipeWire resamples/converts.
   int rate = PW_DEFAULT_RATE;
@@ -126,7 +191,6 @@ PipeWireSource::PipeWireSource(const std::string& name, const std::string& targe
 PipeWireSource::~PipeWireSource()
 {
   stop();
-  delete m_p;
 }
 
 bool PipeWireSource::IsAvailable()
@@ -144,58 +208,81 @@ bool PipeWireSource::IsAvailable()
   if (remote && *remote)
     sock = remote;
   if (access(sock.c_str(), F_OK) != 0)
-  {
-    // Also accept pipewire-pulse socket as fallback indicator (compat mode)
     return false;
-  }
   return true;
 }
 
 void PipeWireSource::play(OutputStream* out)
 {
-  if (m_p->isRunning())
+  if (m_p)
     stop();
   m_output = out;
+  PipeWireRuntime* rt = new PipeWireRuntime();
+  memset(rt, 0, sizeof(*rt));
+  rt->source = this;
+  rt->negotiated.store(false);
+  rt->streaming.store(false);
+  rt->dropped.store(0);
+  rt->ringmem = new char[PW_RING_SIZE];
+  spa_ringbuffer_init(&rt->ring);
+  rt->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (rt->efd < 0)
+  {
+    DBG(DBG_ERROR, "PipeWire: eventfd failed\n");
+    delete[] rt->ringmem;
+    delete rt;
+    m_output = nullptr;
+    return;
+  }
+  m_rt = rt;
+  m_p = new PipeWireLoop(this, rt);
+  m_drain = new PipeWireDrain(this, rt);
   m_p->start();
-  // Wait briefly for format negotiation (max 5s). Stream still works if late:
-  // on_process drops until negotiated.
-  for (int i = 0; i < 50 && !m_p->rt()->negotiated.load(); ++i)
+  m_drain->start();
+  // Wait briefly for format negotiation (max 5s). Audio accumulates
+  // in the ring meanwhile; nothing is lost.
+  for (int i = 0; i < 50 && !rt->negotiated.load(); ++i)
     usleep(100 * 1000);
 }
 
 void PipeWireSource::stop()
 {
-  if (m_p->isRunning())
+  if (!m_p)
+    return;
+  // Wake the drain first so it can't block forever in read()
+  m_drain->requestInterruption();
+  if (m_rt && m_rt->efd >= 0)
   {
-    // Quit the pipewire main loop from this thread (thread-safe)
-    PipeWireRuntime* rt = m_p->rt();
-    if (rt->loop)
-      pw_main_loop_quit(rt->loop);
-    m_p->requestInterruption();
-    m_p->waitFinished();
-    m_output = nullptr;
+    uint64_t one = 1;
+    (void)write(m_rt->efd, &one, sizeof(one));
   }
+  // Quit the pipewire main loop from this thread (thread-safe)
+  if (m_rt && m_rt->loop)
+    pw_main_loop_quit(m_rt->loop);
+  m_p->requestInterruption();
+  m_drain->waitFinished();
+  m_p->waitFinished();
+  if (m_rt)
+  {
+    if (m_rt->efd >= 0)
+      close(m_rt->efd);
+    delete[] m_rt->ringmem;
+    if (m_rt->dropped.load())
+      DBG(DBG_WARN, "PipeWire: total dropped chunks: %u\n", m_rt->dropped.load());
+    delete m_rt;
+    m_rt = nullptr;
+  }
+  delete m_drain;
+  m_drain = nullptr;
+  delete m_p;
+  m_p = nullptr;
+  m_output = nullptr;
 }
 
-PipeWireWorker::PipeWireWorker(PipeWireSource* source)
-: OS::Thread()
-, m_source(source)
-{
-  memset(&m_rt, 0, sizeof(m_rt));
-  m_rt.source = source;
-  m_rt.negotiated.store(false);
-  m_rt.streaming.store(false);
-}
-
-PipeWireWorker::~PipeWireWorker()
-{
-  if (is_running())
-    stop_thread(true);
-}
-
-void* PipeWireWorker::process()
+void* PipeWireLoop::process()
 {
   pw_global_init();
+  PipeWireRuntime* rt = m_rt;
 
   const std::string target = m_source->m_target.empty()
       ? env_or("NOSON_PW_TARGET", "") : m_source->m_target;
@@ -204,8 +291,8 @@ void* PipeWireWorker::process()
   if (captureSink.empty() && target.empty())
     captureSink = "true"; // default: capture default sink monitor (desktop output)
 
-  m_rt.loop = pw_main_loop_new(nullptr);
-  if (!m_rt.loop)
+  rt->loop = pw_main_loop_new(nullptr);
+  if (!rt->loop)
   {
     DBG(DBG_ERROR, "PipeWire: pw_main_loop_new failed\n");
     return nullptr;
@@ -223,18 +310,17 @@ void* PipeWireWorker::process()
   if (!captureSink.empty())
     pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, captureSink.c_str());
 
-  m_rt.format.media_type = 0;
-  m_rt.stream = pw_stream_new_simple(
-      pw_main_loop_get_loop(m_rt.loop),
+  rt->stream = pw_stream_new_simple(
+      pw_main_loop_get_loop(rt->loop),
       m_source->m_name.c_str(),
       props,
       &stream_events,
-      &m_rt);
-  if (!m_rt.stream)
+      rt);
+  if (!rt->stream)
   {
     DBG(DBG_ERROR, "PipeWire: pw_stream_new_simple failed\n");
-    pw_main_loop_destroy(m_rt.loop);
-    m_rt.loop = nullptr;
+    pw_main_loop_destroy(rt->loop);
+    rt->loop = nullptr;
     return nullptr;
   }
 
@@ -244,7 +330,6 @@ void* PipeWireWorker::process()
   raw.format = SPA_AUDIO_FORMAT_S16_LE;
   raw.rate = m_source->m_format.sampleRate;
   raw.channels = m_source->m_format.channelCount;
-  // zero rest (flags, position) for default layout
   raw.flags = 0;
   raw.position[0] = SPA_AUDIO_CHANNEL_FL;
   if (raw.channels > 1)
@@ -255,7 +340,7 @@ void* PipeWireWorker::process()
   const struct spa_pod* params[1];
   params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &raw);
 
-  int res = pw_stream_connect(m_rt.stream,
+  int res = pw_stream_connect(rt->stream,
       PW_DIRECTION_INPUT,
       PW_ID_ANY,
       (pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT |
@@ -265,10 +350,10 @@ void* PipeWireWorker::process()
   if (res < 0)
   {
     DBG(DBG_ERROR, "PipeWire: pw_stream_connect failed: %s\n", spa_strerror(res));
-    pw_stream_destroy(m_rt.stream);
-    m_rt.stream = nullptr;
-    pw_main_loop_destroy(m_rt.loop);
-    m_rt.loop = nullptr;
+    pw_stream_destroy(rt->stream);
+    rt->stream = nullptr;
+    pw_main_loop_destroy(rt->loop);
+    rt->loop = nullptr;
     return nullptr;
   }
 
@@ -276,21 +361,93 @@ void* PipeWireWorker::process()
       target.empty() ? "<default>" : target.c_str(), latency.c_str(),
       m_source->m_format.sampleRate, m_source->m_format.channelCount);
 
-  m_rt.streaming.store(true);
-  pw_main_loop_run(m_rt.loop);
-  m_rt.streaming.store(false);
+  rt->streaming.store(true);
+  pw_main_loop_run(rt->loop);
+  rt->streaming.store(false);
 
-  if (m_rt.stream)
+  if (rt->stream)
   {
-    pw_stream_destroy(m_rt.stream);
-    m_rt.stream = nullptr;
+    pw_stream_destroy(rt->stream);
+    rt->stream = nullptr;
   }
-  if (m_rt.loop)
+  if (rt->loop)
   {
-    pw_main_loop_destroy(m_rt.loop);
-    m_rt.loop = nullptr;
+    pw_main_loop_destroy(rt->loop);
+    rt->loop = nullptr;
   }
   return nullptr;
+}
+
+void* PipeWireDrain::process()
+{
+  // Normal-priority worker, mirrors PASourceWorker: blocking and heavy
+  // work (FLAC encode, ringbuffer mutex, wakeups) is allowed here.
+  const int bytesPerFrame = (int)m_source->m_format.channelCount * 2; // S16
+  const int bite = bytesPerFrame * PW_DRAIN_FRAMES;
+  char* buf = new char[bite];
+  const int channels = m_source->m_format.channelCount;
+  while (!OS::Thread::is_stopped())
+  {
+    uint64_t cnt = 0;
+    ssize_t r = read(m_rt->efd, &cnt, sizeof(cnt));
+    if (r <= 0)
+    {
+      if (errno == EINTR)
+        continue;
+      if (errno == EAGAIN)
+      {
+        usleep(1000);
+        continue;
+      }
+      break; // efd closed or stopped
+    }
+    if (OS::Thread::is_stopped())
+      break;
+    drainAvailable(buf, bite, channels);
+  }
+  // flush whatever remains (partial bite allowed at shutdown)
+  drainAvailable(buf, bite, channels);
+  delete[] buf;
+  return nullptr;
+}
+
+void PipeWireDrain::drainAvailable(char* buf, int bite, int channels)
+{
+  OutputStream* out = m_source->m_output;
+  if (!out)
+    return;
+  const int bpf = channels * 2; // S16LE bytes per frame
+  for (;;)
+  {
+    uint32_t idx = 0;
+    int32_t avail = spa_ringbuffer_get_read_index(&m_rt->ring, &idx);
+    if (avail <= 0)
+      break;
+    // process full bites; a partial tail waits for the next wakeup,
+    // except at shutdown where it is drained in bite-sized steps
+    int len = avail >= bite ? bite : avail;
+    if (len < bite && !OS::Thread::is_stopped())
+      break;
+    len -= len % bpf; // whole frames only
+    if (len <= 0)
+      break; // cannot make progress on a sub-frame tail
+    spa_ringbuffer_read_data(&m_rt->ring, m_rt->ringmem, PW_RING_SIZE,
+                             idx & (PW_RING_SIZE - 1), buf, (uint32_t)len);
+    spa_ringbuffer_read_update(&m_rt->ring, idx + len);
+    if (m_source->m_mute)
+      memset(buf, 0, len);
+    else if (len / bpf >= 2)
+      m_source->m_blankKiller(buf, channels, (len / bpf) / 4);
+    // (a 1-frame tail skips the killer: it unconditionally touches
+    // 2 frames, which would overflow a 1-frame buffer)
+    if (out->Write(buf, len) != len)
+    {
+      DBG(DBG_ERROR, "PipeWire: write() failed\n");
+      break;
+    }
+    if (OS::Thread::is_stopped())
+      break;
+  }
 }
 
 void NSROOT::on_param_changed(void* userdata, uint32_t id, const struct spa_pod* param)
@@ -312,8 +469,9 @@ void NSROOT::on_param_changed(void* userdata, uint32_t id, const struct spa_pod*
 
 void NSROOT::on_process(void* userdata)
 {
+  // REALTIME thread: memcpy/arithmetic only. No encode, no mutex,
+  // no condvar, no logging on the hot path.
   PipeWireRuntime* rt = static_cast<PipeWireRuntime*>(userdata);
-  PipeWireSource* src = rt->source;
   struct pw_buffer* pwbuf = pw_stream_dequeue_buffer(rt->stream);
   if (!pwbuf)
     return;
@@ -321,51 +479,41 @@ void NSROOT::on_process(void* userdata)
   void* data = buf && buf->n_datas > 0 ? buf->datas[0].data : nullptr;
   uint32_t size = buf && buf->n_datas > 0 && buf->datas[0].chunk
       ? buf->datas[0].chunk->size : 0;
-  OutputStream* out = src->m_output;
-  if (data && size && out && rt->negotiated.load())
+  if (data && size && rt->negotiated.load())
   {
     uint32_t fmt = rt->format.info.raw.format;
     if (fmt == SPA_AUDIO_FORMAT_S16_LE || fmt == SPA_AUDIO_FORMAT_S16)
     {
-      int channels = src->m_format.channelCount;
-      if (src->m_mute)
-        memset(data, 0, size);
-      else
-        src->m_blankKiller(data, channels, (int)(size / (2 * channels) / 4));
-      out->Write(static_cast<const char*>(data), (int)size);
+      ring_write(rt, static_cast<const char*>(data), size);
     }
     else if (fmt == SPA_AUDIO_FORMAT_F32_LE || fmt == SPA_AUDIO_FORMAT_F32)
     {
-      // Convert float32 [-1,1] to S16LE in place via temp buffer
+      // Convert float32 [-1,1] to S16LE in small stack chunks
       const float* in = static_cast<const float*>(data);
-      uint32_t frames = size / sizeof(float) / rt->format.info.raw.channels;
       uint32_t ch = rt->format.info.raw.channels;
-      // Stack-friendly chunked conversion; size is typically <= 8k
-      int16_t tmp[8192];
-      uint32_t done = 0;
-      while (done < frames)
+      if (ch > 0 && ch <= 8)
       {
-        uint32_t n = frames - done;
-        if (n > 8192 / ch)
-          n = 8192 / ch;
-        for (uint32_t i = 0; i < n * ch; ++i)
+        uint32_t frames = size / sizeof(float) / ch;
+        int16_t tmp[PW_DRAIN_FRAMES * 8];
+        uint32_t done = 0;
+        while (done < frames)
         {
-          float v = in[done * ch + i];
-          if (v > 1.0f) v = 1.0f;
-          if (v < -1.0f) v = -1.0f;
-          tmp[i] = (int16_t)(v * 32767.0f);
+          uint32_t n = frames - done;
+          if (n > PW_DRAIN_FRAMES)
+            n = PW_DRAIN_FRAMES;
+          for (uint32_t i = 0; i < n * ch; ++i)
+          {
+            float v = in[done * ch + i];
+            if (v > 1.0f) v = 1.0f;
+            if (v < -1.0f) v = -1.0f;
+            tmp[i] = (int16_t)(v * 32767.0f);
+          }
+          ring_write(rt, reinterpret_cast<const char*>(tmp), n * ch * 2);
+          done += n;
         }
-        uint32_t bytes = n * ch * 2;
-        if (src->m_mute)
-          memset(tmp, 0, bytes);
-        else
-          src->m_blankKiller(tmp, (int)ch, (int)(n / 4));
-        if (out->Write(reinterpret_cast<const char*>(tmp), (int)bytes) != (int)bytes)
-          break;
-        done += n;
       }
     }
-    // else: unsupported format, drop
+    // else: unsupported format, drop (negotiation requested S16 so rare)
   }
   pw_stream_queue_buffer(rt->stream, pwbuf);
 }
