@@ -149,7 +149,13 @@ void* ChirpWorker::process()
         {
           chirpLogged = true;
           ++chirpNo;
-          DBG(DBG_INFO, "Chirp #%u start @ %lld ms\n", chirpNo, (long long)mono_ms());
+          timespec wall;
+          clock_gettime(CLOCK_REALTIME, &wall);
+          struct tm tmv;
+          localtime_r(&wall.tv_sec, &tmv);
+          DBG(DBG_INFO, "Chirp #%u start @ %lld ms (wall %02d:%02d:%02d.%03ld)\n",
+              chirpNo, (long long)mono_ms(),
+              tmv.tm_hour, tmv.tm_min, tmv.tm_sec, wall.tv_nsec / 1000000);
         }
       }
       else
