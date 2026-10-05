@@ -54,6 +54,7 @@ public:
 private:
   void* process() override;
   ChirpSource* m_source;
+  unsigned m_maxChirps; // 0 = infinite
 };
 
 }
@@ -101,7 +102,15 @@ void ChirpSource::stop()
 ChirpWorker::ChirpWorker(ChirpSource* source)
 : OS::Thread()
 , m_source(source)
+, m_maxChirps(0)
 {
+  const char* e = std::getenv("NOSON_CHIRP_COUNT");
+  if (e && *e)
+  {
+    int v = atoi(e);
+    if (v > 0 && v <= 1000)
+      m_maxChirps = (unsigned)v;
+  }
 }
 
 ChirpWorker::~ChirpWorker()
@@ -131,7 +140,9 @@ void* ChirpWorker::process()
     for (int f = 0; f < CHIRP_FRAMES; ++f)
     {
       int16_t v = 0;
-      if (pos >= periodFrames - chirpFrames)
+      bool inChirp = pos >= periodFrames - chirpFrames
+          && !(m_maxChirps && chirpNo >= m_maxChirps);
+      if (inChirp)
       {
         int ct = pos - (periodFrames - chirpFrames); // 0 .. chirpFrames
         double t = (double)ct / CHIRP_RATE;
