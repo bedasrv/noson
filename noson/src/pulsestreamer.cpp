@@ -18,6 +18,9 @@
 
 #include "pulsestreamer.h"
 #include "local_config.h"
+#if defined(HAVE_PULSEAUDIO) || defined(HAVE_PIPEWIRE)
+#include "chirpsource.h"
+#endif
 #ifdef HAVE_PULSEAUDIO
 #include "pacontrol.h"
 #include "pasource.h"
@@ -36,6 +39,7 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 
 /* Important: It MUST match with the static declaration from datareader.cpp */
 #define PULSESTREAMER_ICON      "pulseaudio.png"
@@ -45,7 +49,8 @@
 #define PULSESTREAMER_MAX_PB    3
 #define PULSESTREAMER_CHUNK     32752
 #define PULSESTREAMER_TM_MUTE   3000
-#define PULSESTREAMER_TM_MUTE_PW 400
+#define PULSESTREAMER_TM_MUTE_PW 150
+#define PULSESTREAMER_CHUNK_PW  8192
 #define PA_SINK_NAME            "noson"
 #define PA_CLIENT_NAME          PA_SINK_NAME
 
@@ -63,6 +68,25 @@ static unsigned GetMuteTimeoutMs(bool pw)
       return (unsigned)v;
   }
   return pw ? PULSESTREAMER_TM_MUTE_PW : PULSESTREAMER_TM_MUTE;
+}
+
+static unsigned GetChunkBytes()
+{
+  const char* e = std::getenv("NOSON_CHUNK_BYTES");
+  if (e && *e)
+  {
+    int v = atoi(e);
+    if (v >= 4096 && v <= PULSESTREAMER_CHUNK)
+      return (unsigned)v;
+  }
+  return PULSESTREAMER_CHUNK_PW;
+}
+
+static int64_t mono_ms()
+{
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 using namespace NSROOT;
@@ -357,26 +381,49 @@ void PulseStreamer::streamSinkPW(handle * handle)
 
   // Target selection: NOSON_PW_TARGET env or explicit device, else default
   // sink monitor (see PipeWireSource). No null-sink is created on this path.
+  // NOSON_TEST_TONE=chirp sends an in-process test chirp instead of audio
+  // hardware, with per-chirp send timestamps for latency measurement.
   const char* envTarget = std::getenv("NOSON_PW_TARGET");
   std::string target = envTarget ? envTarget : "";
-  DBG(DBG_INFO, "%s: pipewire capture target='%s'\n", __FUNCTION__,
-      target.empty() ? "<default sink monitor>" : target.c_str());
+  const char* testTone = std::getenv("NOSON_TEST_TONE");
+  const bool useChirp = testTone && strcmp(testTone, "chirp") == 0;
+  DBG(DBG_INFO, "%s: %s target='%s'\n", __FUNCTION__,
+      useChirp ? "chirp test tone" : "pipewire capture",
+      useChirp ? "<internal>" : (target.empty() ? "<default sink monitor>" : target.c_str()));
 
-  PipeWireSource audioSource(PA_CLIENT_NAME, target);
+  AudioSource* audioSource = nullptr;
+  PipeWireSource* pwSource = nullptr;
+  ChirpSource* chirpSource = nullptr;
+  if (useChirp)
+  {
+    chirpSource = new ChirpSource(PA_CLIENT_NAME);
+    audioSource = chirpSource;
+  }
+  else
+  {
+    pwSource = new PipeWireSource(PA_CLIENT_NAME, target);
+    audioSource = pwSource;
+  }
   FLACEncoder audioEncoder;
   BufferedStream stream(64);
-  if (!audioEncoder.open(audioSource.getFormat(), &stream))
+  if (!audioEncoder.open(audioSource->getFormat(), &stream))
   {
     DBG(DBG_ERROR, "%s: flac open failed\n", __FUNCTION__);
     TraceResponseStatus(500);
     reply.CloseReply(WS_STATUS_500_Internal_Server_Error);
     *m_playbackCount.GetExclusive() -= 1;
+    delete audioSource;
     return;
   }
 
-  audioSource.mute(true);
+  audioSource->mute(true);
   OS::Timeout muted(GetMuteTimeoutMs(true));
-  audioSource.play(&audioEncoder);
+  audioSource->play(&audioEncoder);
+
+  const unsigned chunkBytes = GetChunkBytes();
+  int64_t tStart = mono_ms();
+  uint64_t totalBytes = 0;
+  int64_t tNextLog = tStart + 2000;
 
   TraceResponseStatus(200);
   reply.AddHeader(WS_HEADER_Content_Type, "audio/flac");
@@ -384,9 +431,9 @@ void PulseStreamer::streamSinkPW(handle * handle)
   reply.AddHeader(WS_HEADER_Transfer_Encoding, "chunked");
   if (reply.PostReply(WS_STATUS_200_OK))
   {
-    char * buf = new char [PULSESTREAMER_CHUNK + 16];
+    char * buf = new char [chunkBytes + 16];
     int r = 0;
-    while (!IsAborted() && (r = stream.ReadAsync(buf + 5 + WS_CRLF_LEN, PULSESTREAMER_CHUNK, PULSESTREAMER_TIMEOUT)) > 0)
+    while (!IsAborted() && (r = stream.ReadAsync(buf + 5 + WS_CRLF_LEN, chunkBytes, PULSESTREAMER_TIMEOUT)) > 0)
     {
       char str[5 + WS_CRLF_LEN + 1];
       snprintf(str, sizeof(str), "%05x" WS_CRLF, (unsigned)r & 0xfffff);
@@ -394,16 +441,27 @@ void PulseStreamer::streamSinkPW(handle * handle)
       memcpy(buf + 5 + WS_CRLF_LEN + r, WS_CRLF, WS_CRLF_LEN);
       if (!handle->broker->ReplyData(buf, 5 + WS_CRLF_LEN + r + WS_CRLF_LEN))
         break;
-      if (audioSource.muted() && !muted.time_left())
-        audioSource.mute(false);
+      totalBytes += (uint64_t)r;
+      int64_t now = mono_ms();
+      if (now >= tNextLog)
+      {
+        double secs = (now - tStart) / 1000.0;
+        DBG(DBG_INFO, "%s: sent %llu bytes in %.1fs (%.1f kB/s)\n", __FUNCTION__,
+            (unsigned long long)totalBytes, secs,
+            secs > 0 ? totalBytes / 1024.0 / secs : 0.0);
+        tNextLog = now + 2000;
+      }
+      if (audioSource->muted() && !muted.time_left())
+        audioSource->mute(false);
     }
     delete [] buf;
     if (r == 0)
       handle->broker->ReplyData("0" WS_CRLF WS_CRLF, 1 + WS_CRLF_LEN + WS_CRLF_LEN);
   }
 
-  audioSource.stop();
+  audioSource->stop();
   audioEncoder.close();
+  delete audioSource;
   *m_playbackCount.GetExclusive() -= 1;
   // No null-sink to free on the PipeWire path
 #else
