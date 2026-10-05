@@ -20,7 +20,29 @@
 #include "private/byteorder.h"
 #include "private/debug.h"
 
+#include <cstdlib>
+
 #define SAMPLES 1024
+
+static int GetFlacLevel()
+{
+  const char* e = std::getenv("NOSON_FLAC_LEVEL");
+  if (e && *e)
+  {
+    int v = atoi(e);
+    if (v >= 0 && v <= 8)
+      return v;
+  }
+  return 0; // low-latency default (was 5)
+}
+
+static bool GetFlacVerify()
+{
+  const char* e = std::getenv("NOSON_FLAC_VERIFY");
+  if (e && *e)
+    return atoi(e) != 0;
+  return false; // skip verify for lower CPU/latency (was true)
+}
 
 using namespace NSROOT;
 
@@ -61,13 +83,13 @@ bool FLACEncoder::open(const AudioFormat& inputFormat, OutputStream * out)
   // configure the encoder
   if (!(m_ok = m_inputFormat.isValid()))
     DBG(DBG_WARN, "ERROR: Invalid format\n");
-  else if (!(m_ok = m_encoder->set_verify(true)))
+  else if (!(m_ok = m_encoder->set_verify(GetFlacVerify())))
     DBG(DBG_WARN, "ERROR: Set verify failed\n");
   else if (!(m_ok = m_encoder->set_streamable_subset(true)))
     DBG(DBG_WARN, "ERROR: Set streamable subset failed\n");
   else if (!(m_ok = m_encoder->set_total_samples_estimate(0)))
     DBG(DBG_WARN, "ERROR: Set total samples estimate failed\n");
-  else if (!(m_ok = m_encoder->set_compression_level(5)))
+  else if (!(m_ok = m_encoder->set_compression_level(GetFlacLevel())))
     DBG(DBG_WARN, "ERROR: Set compression level failed\n");
   else if (!(m_ok = m_encoder->set_channels(m_inputFormat.channelCount)))
     DBG(DBG_WARN, "ERROR: Set channels (%d) failed\n", m_inputFormat.channelCount);

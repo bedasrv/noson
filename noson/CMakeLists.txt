@@ -113,11 +113,15 @@ if (NOT FLACXX_FOUND)
 endif ()
 find_package(Pulse)
 find_package(Pulse-simple)
+find_package(PipeWire)
 
 if (FLACXX_FOUND AND FLAC_FOUND)
   set (HAVE_FLAC 1 CACHE INTERNAL "Enable FLAC feature" FORCE)
   if (PULSESIMPLE_FOUND AND PULSE_FOUND)
     set (HAVE_PULSEAUDIO 1 CACHE INTERNAL "Enable PulseAudio feature" FORCE)
+  endif ()
+  if (PIPEWIRE_FOUND)
+    set (HAVE_PIPEWIRE 1 CACHE INTERNAL "Enable PipeWire feature" FORCE)
   endif ()
 endif ()
 
@@ -197,14 +201,20 @@ file (COPY ${CMAKE_CURRENT_SOURCE_DIR}/src/filestreamer.h
 if(HAVE_FLAC)
   file (COPY ${CMAKE_CURRENT_SOURCE_DIR}/src/flacencoder.h
     DESTINATION ${noson_PUBLIC_DIR})
+  if(HAVE_PULSEAUDIO OR HAVE_PIPEWIRE)
+    file (COPY ${CMAKE_CURRENT_SOURCE_DIR}/src/pulsestreamer.h
+      DESTINATION ${noson_PUBLIC_DIR})
+  endif()
   if(HAVE_PULSEAUDIO)
     file (COPY ${CMAKE_CURRENT_SOURCE_DIR}/src/pacontrol.h
       DESTINATION ${noson_PUBLIC_DIR})
     file (COPY ${CMAKE_CURRENT_SOURCE_DIR}/src/pasource.h
       DESTINATION ${noson_PUBLIC_DIR})
-    file (COPY ${CMAKE_CURRENT_SOURCE_DIR}/src/pulsestreamer.h
-      DESTINATION ${noson_PUBLIC_DIR})
     file (COPY ${CMAKE_CURRENT_SOURCE_DIR}/src/dlsym_pulse.h
+      DESTINATION ${noson_PUBLIC_DIR})
+  endif()
+  if(HAVE_PIPEWIRE)
+    file (COPY ${CMAKE_CURRENT_SOURCE_DIR}/src/pipesource.h
       DESTINATION ${noson_PUBLIC_DIR})
   endif()
 endif()
@@ -307,20 +317,28 @@ if (HAVE_FLAC)
   include_directories (BEFORE SYSTEM ${FLACXX_INCLUDE_DIR})
   list (APPEND STREAM_SRC_FILES src/flacencoder.cpp)
   list (APPEND STREAM_HDR_FILES src/flacencoder.h)
+  if (HAVE_PULSEAUDIO OR HAVE_PIPEWIRE)
+    list (APPEND STREAM_SRC_FILES src/pulsestreamer.cpp)
+    list (APPEND STREAM_HDR_FILES src/pulsestreamer.h)
+  endif ()
   if (HAVE_PULSEAUDIO)
     include_directories (${PULSESIMPLE_INCLUDE_DIR} ${PULSE_INCLUDE_DIR})
     list (APPEND STREAM_SRC_FILES
       src/dlsym_pulse.c
       src/pacontrol.cpp
       src/pasource.cpp
-      src/pulsestreamer.cpp
     )
     list (APPEND STREAM_HDR_FILES
       src/dlsym_pulse.h
       src/pacontrol.h
       src/pasource.h
-      src/pulsestreamer.h
     )
+  endif ()
+  if (HAVE_PIPEWIRE)
+    include_directories (BEFORE SYSTEM ${PIPEWIRE_INCLUDE_DIRS})
+    add_definitions (${PIPEWIRE_CFLAGS_OTHER})
+    list (APPEND STREAM_SRC_FILES src/pipesource.cpp)
+    list (APPEND STREAM_HDR_FILES src/pipesource.h)
   endif ()
 endif ()
 
@@ -352,6 +370,9 @@ if (OPENSSL_FOUND)
 endif ()
 if(HAVE_FLAC)
   target_link_libraries (noson ${FLACXX_LIBRARIES} ${FLAC_LIBRARIES})
+endif()
+if(HAVE_PIPEWIRE)
+  target_link_libraries (noson ${PIPEWIRE_LIBRARIES})
 endif()
 
 if (MSVC)

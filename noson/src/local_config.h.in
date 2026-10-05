@@ -41,6 +41,9 @@
 #undef HAVE_PULSEAUDIO
 #cmakedefine HAVE_PULSEAUDIO @HAVE_PULSEAUDIO@
 
+#undef HAVE_PIPEWIRE
+#cmakedefine HAVE_PIPEWIRE @HAVE_PIPEWIRE@
+
 #undef HAVE_FLAC
 #cmakedefine HAVE_FLAC @HAVE_FLAC@
 

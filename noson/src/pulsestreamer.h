@@ -56,6 +56,8 @@ private:
   std::string GetPASink();
   void FreePASink();
   void streamSink(handle * handle);
+  void streamSinkPW(handle * handle);
+  bool UsePipeWire();
 };
 
 }

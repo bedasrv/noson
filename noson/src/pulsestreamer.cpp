@@ -17,8 +17,14 @@
  */
 
 #include "pulsestreamer.h"
+#include "local_config.h"
+#ifdef HAVE_PULSEAUDIO
 #include "pacontrol.h"
 #include "pasource.h"
+#endif
+#ifdef HAVE_PIPEWIRE
+#include "pipesource.h"
+#endif
 #include "flacencoder.h"
 #include "requestbroker.h"
 #include "data/datareader.h"
@@ -29,6 +35,7 @@
 #include "private/os/threads/timeout.h"
 
 #include <cstring>
+#include <cstdlib>
 
 /* Important: It MUST match with the static declaration from datareader.cpp */
 #define PULSESTREAMER_ICON      "pulseaudio.png"
@@ -38,8 +45,25 @@
 #define PULSESTREAMER_MAX_PB    3
 #define PULSESTREAMER_CHUNK     32752
 #define PULSESTREAMER_TM_MUTE   3000
+#define PULSESTREAMER_TM_MUTE_PW 400
 #define PA_SINK_NAME            "noson"
 #define PA_CLIENT_NAME          PA_SINK_NAME
+
+#ifndef PA_INVALID_INDEX
+#define PA_INVALID_INDEX 0xffffffffu
+#endif
+
+static unsigned GetMuteTimeoutMs(bool pw)
+{
+  const char* e = std::getenv("NOSON_MUTE_MS");
+  if (e && *e)
+  {
+    int v = atoi(e);
+    if (v >= 0 && v <= 10000)
+      return (unsigned)v;
+  }
+  return pw ? PULSESTREAMER_TM_MUTE_PW : PULSESTREAMER_TM_MUTE;
+}
 
 using namespace NSROOT;
 
@@ -70,9 +94,17 @@ PulseStreamer::PulseStreamer(RequestBroker * imageService /*= nullptr*/)
 
 bool PulseStreamer::Initialize()
 {
+#ifdef HAVE_PULSEAUDIO
   if (initialize_pulse(1) == 0)
     return true;
+#endif
+#ifdef HAVE_PIPEWIRE
+  // PipeWire needs no dlopen init; availability is checked per-stream
+  // so we can always succeed here when compiled with PipeWire support.
+  return true;
+#else
   return false;
+#endif
 }
 
 bool PulseStreamer::HandleRequest(handle * handle)
@@ -135,8 +167,27 @@ void PulseStreamer::UnregisterResource(const std::string& uri)
   (void)uri;
 }
 
+bool PulseStreamer::UsePipeWire()
+{
+#ifdef HAVE_PIPEWIRE
+  const char* backend = std::getenv("NOSON_AUDIO_BACKEND");
+  if (backend && *backend)
+  {
+    if (strcmp(backend, "pulse") == 0)
+      return false;
+    if (strcmp(backend, "pipewire") == 0)
+      return true;
+  }
+  // Prefer native PipeWire when the daemon is reachable; fallback to Pulse.
+  if (PipeWireSource::IsAvailable())
+    return true;
+#endif
+  return false;
+}
+
 std::string PulseStreamer::GetPASink()
 {
+#ifdef HAVE_PULSEAUDIO
   std::string deviceName;
   PAControl::SinkList sinks;
   PAControl pacontrol(PA_CLIENT_NAME);
@@ -180,10 +231,14 @@ std::string PulseStreamer::GetPASink()
       break;
   }
   return deviceName;
+#else
+  return std::string();
+#endif
 }
 
 void PulseStreamer::FreePASink()
 {
+#ifdef HAVE_PULSEAUDIO
   PAControl pacontrol(PA_CLIENT_NAME);
   if (pacontrol.connect())
   {
@@ -191,10 +246,17 @@ void PulseStreamer::FreePASink()
     pacontrol.deleteSink(m_sinkIndex.Load());
     pacontrol.disconnect();
   }
+#endif
 }
 
 void PulseStreamer::streamSink(handle * handle)
 {
+  if (UsePipeWire())
+  {
+    streamSinkPW(handle);
+    return;
+  }
+#ifdef HAVE_PULSEAUDIO
   WSRequestReply reply(*handle->broker);
   if (!handle->broker->GetRequestHeader(WS_HEADER_Range).empty())
   {
@@ -227,7 +289,7 @@ void PulseStreamer::streamSink(handle * handle)
 
     // the source is muted for a short time to limit output rate on startup
     audioSource.mute(true);
-    OS::Timeout muted(PULSESTREAMER_TM_MUTE);
+    OS::Timeout muted(GetMuteTimeoutMs(false));
 
     audioSource.play(&audioEncoder);
 
@@ -265,4 +327,86 @@ void PulseStreamer::streamSink(handle * handle)
   Locked<int>::pointer p = m_playbackCount.GetExclusive();
   if (*p == 0)
     FreePASink();
+#else
+  WSRequestReply reply(*handle->broker);
+  TraceResponseStatus(503);
+  reply.CloseReply(WS_STATUS_503_Service_Unavailable);
+#endif
+}
+
+void PulseStreamer::streamSinkPW(handle * handle)
+{
+#ifdef HAVE_PIPEWIRE
+  WSRequestReply reply(*handle->broker);
+  if (!handle->broker->GetRequestHeader(WS_HEADER_Range).empty())
+  {
+    DBG(DBG_WARN, "%s: cannot seek in stream\n", __FUNCTION__);
+    TraceResponseStatus(400);
+    reply.CloseReply(WS_STATUS_400_Bad_Request);
+    return;
+  }
+
+  *m_playbackCount.GetExclusive() += 1;
+  if (m_playbackCount.Load() > PULSESTREAMER_MAX_PB)
+  {
+    TraceResponseStatus(429);
+    reply.CloseReply(WS_STATUS_429_Too_Many_Requests);
+    *m_playbackCount.GetExclusive() -= 1;
+    return;
+  }
+
+  // Target selection: NOSON_PW_TARGET env or explicit device, else default
+  // sink monitor (see PipeWireSource). No null-sink is created on this path.
+  const char* envTarget = std::getenv("NOSON_PW_TARGET");
+  std::string target = envTarget ? envTarget : "";
+  DBG(DBG_INFO, "%s: pipewire capture target='%s'\n", __FUNCTION__,
+      target.empty() ? "<default sink monitor>" : target.c_str());
+
+  PipeWireSource audioSource(PA_CLIENT_NAME, target);
+  FLACEncoder audioEncoder;
+  BufferedStream stream(64);
+  if (!audioEncoder.open(audioSource.getFormat(), &stream))
+  {
+    DBG(DBG_ERROR, "%s: flac open failed\n", __FUNCTION__);
+    TraceResponseStatus(500);
+    reply.CloseReply(WS_STATUS_500_Internal_Server_Error);
+    *m_playbackCount.GetExclusive() -= 1;
+    return;
+  }
+
+  audioSource.mute(true);
+  OS::Timeout muted(GetMuteTimeoutMs(true));
+  audioSource.play(&audioEncoder);
+
+  TraceResponseStatus(200);
+  reply.AddHeader(WS_HEADER_Content_Type, "audio/flac");
+  reply.AddHeader(WS_HEADER_Accept_Ranges, "none");
+  reply.AddHeader(WS_HEADER_Transfer_Encoding, "chunked");
+  if (reply.PostReply(WS_STATUS_200_OK))
+  {
+    char * buf = new char [PULSESTREAMER_CHUNK + 16];
+    int r = 0;
+    while (!IsAborted() && (r = stream.ReadAsync(buf + 5 + WS_CRLF_LEN, PULSESTREAMER_CHUNK, PULSESTREAMER_TIMEOUT)) > 0)
+    {
+      char str[5 + WS_CRLF_LEN + 1];
+      snprintf(str, sizeof(str), "%05x" WS_CRLF, (unsigned)r & 0xfffff);
+      memcpy(buf, str, 5 + WS_CRLF_LEN);
+      memcpy(buf + 5 + WS_CRLF_LEN + r, WS_CRLF, WS_CRLF_LEN);
+      if (!handle->broker->ReplyData(buf, 5 + WS_CRLF_LEN + r + WS_CRLF_LEN))
+        break;
+      if (audioSource.muted() && !muted.time_left())
+        audioSource.mute(false);
+    }
+    delete [] buf;
+    if (r == 0)
+      handle->broker->ReplyData("0" WS_CRLF WS_CRLF, 1 + WS_CRLF_LEN + WS_CRLF_LEN);
+  }
+
+  audioSource.stop();
+  audioEncoder.close();
+  *m_playbackCount.GetExclusive() -= 1;
+  // No null-sink to free on the PipeWire path
+#else
+  (void)handle;
+#endif
 }
