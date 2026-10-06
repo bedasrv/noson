@@ -643,7 +643,7 @@ void System::DeleteServiceOAuth(const std::string& type, const std::string& sn)
 
 bool System::HavePulseAudio()
 {
-#ifdef HAVE_PULSEAUDIO
+#if defined(HAVE_PULSEAUDIO) || defined(HAVE_PIPEWIRE)
   return true;
 #else
   return false;

@@ -32,7 +32,7 @@
 #include "sonossystem.h"
 #include "filestreamer.h"
 #include "imageservice.h"
-#ifdef HAVE_PULSEAUDIO
+#if defined(HAVE_PULSEAUDIO) || defined(HAVE_PIPEWIRE)
 #include "pulsestreamer.h"
 #endif
 
@@ -497,7 +497,7 @@ bool Player::SetCurrentURI(const DigitalItemPtr& item)
 bool Player::PlayPulse()
 {
   RequestBroker::ResourcePtr res(nullptr);
-#ifdef HAVE_PULSEAUDIO
+#if defined(HAVE_PULSEAUDIO) || defined(HAVE_PIPEWIRE)
   RequestBrokerPtr rb = m_eventHandler.GetRequestBroker(PULSESTREAMER_CNAME);
   if (rb)
     res = rb->GetResource(PULSESTREAMER_CNAME);
@@ -526,7 +526,7 @@ bool Player::PlayPulse()
 bool Player::IsPulseStream(const std::string& streamURL)
 {
   RequestBrokerPtr rb(nullptr);
-#ifdef HAVE_PULSEAUDIO
+#if defined(HAVE_PULSEAUDIO) || defined(HAVE_PIPEWIRE)
   rb = m_eventHandler.GetRequestBroker(PULSESTREAMER_CNAME);
 #endif
   if (rb && IsMyStream(streamURL))

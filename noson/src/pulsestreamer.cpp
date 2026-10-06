@@ -119,14 +119,17 @@ PulseStreamer::PulseStreamer(RequestBroker * imageService /*= nullptr*/)
 
 bool PulseStreamer::Initialize()
 {
+#ifdef HAVE_PIPEWIRE
+  // Best-effort: Sonos output device visible in sound settings from app
+  // start. A missing/broken PipeWire never fails init; streaming falls
+  // back to other paths.
+  EnsureVirtualSink();
+#endif
 #ifdef HAVE_PULSEAUDIO
   if (initialize_pulse(1) == 0)
     return true;
 #endif
 #ifdef HAVE_PIPEWIRE
-  // PipeWire needs no dlopen init; availability is checked per-stream
-  // so we can always succeed here when compiled with PipeWire support.
-  // The virtual sink is created below in streamSinkPW on first use...
   return true;
 #else
   return false;
