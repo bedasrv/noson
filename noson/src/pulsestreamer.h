@@ -23,6 +23,8 @@
 #include "locked.h"
 
 #include <functional>
+#include <mutex>
+#include <set>
 
 #define PULSESTREAMER_CNAME   "pulse"
 #define PULSESTREAMER_URI     "/music/pulse.flac"
@@ -70,6 +72,12 @@ private:
   // its destruction) may replace/clear the handler.
   VolumeHandler m_volHandler;
   const void* m_volOwner;
+  // IPs currently pulling the stream: the slider drives these speakers
+  // directly, no matter which path started their playback.
+  std::set<std::string> m_pullers;
+  std::mutex m_pullMutex;
+  void TrackPuller(const std::string& ip, bool add);
+  void InstallPullerVolumeHandler();
 
   std::string GetPASink();
   void FreePASink();

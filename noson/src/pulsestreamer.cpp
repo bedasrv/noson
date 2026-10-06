@@ -30,6 +30,7 @@
 #endif
 #include "flacencoder.h"
 #include "requestbroker.h"
+#include "renderingcontrol.h"
 #include "data/datareader.h"
 #include "private/debug.h"
 #include "private/wsstatic.h"
@@ -40,6 +41,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <cmath>
+#include <mutex>
+#include <set>
 
 /* Important: It MUST match with the static declaration from datareader.cpp */
 #define PULSESTREAMER_ICON      "pulseaudio.png"
@@ -169,9 +173,61 @@ bool PulseStreamer::EnsureVirtualSink()
     m_pwSink = nullptr;
     return false;
   }
+  // Default slider mapping: whoever pulls the stream gets driven.
+  // A zone player may override this when it starts pulse playback.
+  InstallPullerVolumeHandler();
   return true;
 #else
   return false;
+#endif
+}
+
+void PulseStreamer::TrackPuller(const std::string& ip, bool add)
+{
+  if (ip.empty())
+    return;
+  std::lock_guard<std::mutex> lk(m_pullMutex);
+  if (add)
+    m_pullers.insert(ip);
+  else
+    m_pullers.erase(ip);
+}
+
+void PulseStreamer::InstallPullerVolumeHandler()
+{
+#ifdef HAVE_PIPEWIRE
+  if (m_volHandler)
+    return; // a zone player owns the mapping already
+  m_volOwner = this;
+  m_volHandler = [this](float v, bool mute) {
+    std::set<std::string> ips;
+    {
+      std::lock_guard<std::mutex> lk(m_pullMutex);
+      ips = m_pullers;
+    }
+    float c = v < 0.0f ? 0.0f : v;
+    int sv = c >= 1.0f ? 100 : (int)(100.0f * cbrtf(c) + 0.5f);
+    if (sv > 100)
+      sv = 100;
+    else if (sv < 0)
+      sv = 0;
+    for (std::set<std::string>::const_iterator it = ips.begin();
+         it != ips.end(); ++it)
+    {
+      RenderingControl rc(*it, 1400);
+      if (mute)
+        rc.SetMute(1);
+      else
+      {
+        rc.SetMute(0);
+        rc.SetVolume((uint8_t)sv);
+      }
+    }
+  };
+  if (m_pwSink)
+    m_pwSink->setVolumeHandler(m_volHandler);
+#else
+  (void)0;
 #endif
 }
 
@@ -449,6 +505,20 @@ void PulseStreamer::streamSinkPW(handle * handle)
     *m_playbackCount.GetExclusive() -= 1;
     return;
   }
+
+  // Track this puller by peer IP so the slider can drive its speaker
+  // no matter which path started the playback. Removed on scope exit.
+  struct PullerGuard {
+    PullerGuard(PulseStreamer* s, const std::string& ip) : self(s), addr(ip)
+    { if (self) self->TrackPuller(addr, true); }
+    ~PullerGuard()
+    { if (self) self->TrackPuller(addr, false); }
+    PulseStreamer* self;
+    std::string addr;
+  };
+  PullerGuard pullerGuard(this,
+      handle && handle->broker ? handle->broker->GetRemoteAddrInfo()
+                               : std::string());
 
   // Target selection: explicit NOSON_PW_TARGET wins (e.g. raw mic);
   // otherwise the persistent virtual sink ("Sonos" output device);
