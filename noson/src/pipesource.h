@@ -29,17 +29,16 @@ namespace NSROOT
 
 // PCM rings (powers of two).
 // Own-capture ring: 256KB ~= 1.3s at S16LE 48k stereo.
-// Virtual-sink tap rings: 64KB ~= 0.33s each; up to 3 concurrent taps.
+// Drain bite matches upstream PASource FRAME_BUFFER (256 frames).
 #define PW_RING_SIZE         262144
-#define PW_TAP_RING_SIZE     65536
-#define PW_MAX_TAPS          3
 // Drain bite matches upstream PASource FRAME_BUFFER (256 frames).
 #define PW_DRAIN_FRAMES      256
 
 class PipeWireLoop;
 class PipeWireDrain;
+class PipeWireMonitorLoop;
 struct PipeWireRuntime;
-struct PipeWireTap;
+class PipeWireVirtualSink;
 
 void on_process(void* userdata);
 void on_param_changed(void* userdata, uint32_t id, const struct spa_pod* param);
@@ -53,9 +52,6 @@ class PipeWireSource : public AudioSource
 public:
   // Own-capture mode: connects to target (or default source/monitor).
   PipeWireSource(const std::string& name, const std::string& target);
-  // Attach mode: drains one tap of a running virtual sink (no loop).
-  PipeWireSource(struct PipeWireRuntime* sharedRt, int tapIdx,
-                 const AudioFormat& format);
   virtual ~PipeWireSource() override;
 
   std::string getName() const override { return m_name; }
@@ -76,16 +72,43 @@ private:
 
   void(*m_blankKiller)(void*, int, int);
 
-  bool m_ownsRt;
-  int m_tapIdx; // attach mode tap, -1 when none
   PipeWireLoop* m_p;
   PipeWireDrain* m_drain;
   PipeWireRuntime* m_rt;
 };
 
+// Blocking monitor capture: reads the virtual sink's monitor source
+// with pa_simple (server-paced, like upstream PASource), 256-frame
+// bites, startup mute + blank killer + exact float unscale of the
+// sink soft volume (32-bit intermediate, transparent).
+class PipeWireMonitorSource : public AudioSource
+{
+  friend class PipeWireMonitorLoop;
+public:
+  PipeWireMonitorSource(const std::string& name, const std::string& monitor,
+                        PipeWireVirtualSink* sink);
+  virtual ~PipeWireMonitorSource() override;
+
+  std::string getName() const override { return m_name; }
+  std::string getDescription() const override { return m_monitor; }
+  AudioFormat getFormat() const override { return m_format; }
+
+  void play(OutputStream* out) override;
+  void stop() override;
+
+private:
+  std::string m_name;
+  std::string m_monitor;
+  AudioFormat m_format;
+  OutputStream* m_output;
+  void(*m_blankKiller)(void*, int, int);
+  PipeWireVirtualSink* m_sink;
+  class PipeWireMonitorLoop* m_loop;
+};
+
 // Persistent virtual sink: appears in the OS sound settings as a regular
-// output device (e.g. "Sonos"). Apps playing to it feed Sonos-bound taps;
-// with no active playback the audio is dropped (apps never stall).
+// output device (e.g. "Sonos"). Its monitor source feeds Sonos-bound
+// sessions; with no active playback nothing is captured.
 class PipeWireVirtualSink
 {
   friend class PipeWireVolumeSync;
@@ -102,8 +125,9 @@ public:
   bool start();
   void stop();
   bool isRunning() const;
-  bool hasFreeTap() const;
-  int attachTap();
+  const std::string& monitorName() const { return m_monitorName; }
+  float currentVolume() const;
+  bool currentMute() const;
   struct PipeWireRuntime* runtime() const { return m_rt; }
   AudioFormat format() const { return m_format; }
   void setVolumeHandler(VolumeHandler h);
@@ -111,6 +135,7 @@ public:
 private:
   std::string m_name;
   std::string m_desc;
+  std::string m_monitorName;
   AudioFormat m_format;
   struct PipeWireRuntime* m_rt;
   class PipeWireLoop* m_loop;

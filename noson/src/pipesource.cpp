@@ -16,6 +16,10 @@
 #include "private/os/threads/thread.h"
 #include "private/os/threads/timeout.h"
 
+#ifdef HAVE_PULSEAUDIO
+#include "dlsym_pulse.h"
+#endif
+
 #include <pipewire/pipewire.h>
 #include <pipewire/loop.h>
 #include <pipewire/core.h>
@@ -49,14 +53,6 @@ using namespace NSROOT;
 namespace NSROOT
 {
 
-struct PipeWireTap
-{
-  std::atomic<bool> active;
-  struct spa_ringbuffer ring;
-  char* mem;
-  int efd;
-};
-
 struct PipeWireRuntime
 {
   struct pw_main_loop* loop;
@@ -72,10 +68,6 @@ struct PipeWireRuntime
   char* ringmem;
   int efd;
   std::atomic<unsigned> dropped;
-  // virtual-sink taps: fixed slots, sink-owned memory (never freed
-  // while the sink lives, so the RT callback needs no locks)
-  PipeWireTap taps[PW_MAX_TAPS];
-  std::atomic_flag tapLock;
   // OS volume of the sink node (Plasma slider): linear 1.0 == 100%.
   // Updated from Props param events (loop thread), read by the volume
   // worker and by drains for PCM unscaling. Defaults to full scale.
@@ -141,6 +133,156 @@ private:
   uint32_t m_size;
   int m_efd;
 };
+
+// Monitor bite matches upstream PASource FRAME_BUFFER (256 frames).
+#define PW_MONITOR_FRAMES      256
+
+static AudioFormat defaultFormat(); // defined below (format helpers)
+
+// Blocking monitor worker: mirrors upstream PASourceWorker. A normal
+// thread blocking in pa_simple_read (server-paced realtime); mute,
+// blank killer and exact float unscale run here, never in RT context.
+class PipeWireMonitorLoop : private OS::Thread
+{
+public:
+  PipeWireMonitorLoop(PipeWireMonitorSource* source,
+                      const std::string& name, const std::string& monitor,
+                      const AudioFormat& format)
+  : OS::Thread(), m_source(source), m_name(name), m_monitor(monitor)
+  , m_format(format) { }
+  virtual ~PipeWireMonitorLoop() override
+  {
+    if (is_running())
+      stop_thread(true);
+  }
+  bool isRunning() { return OS::Thread::is_running(); }
+  void start() { OS::Thread::start_thread(true); }
+  void requestInterruption() { OS::Thread::stop_thread(false); }
+  bool waitFinished() { return OS::Thread::wait_thread((unsigned)-1); }
+private:
+  void* process() override;
+  PipeWireMonitorSource* m_source;
+  std::string m_name;
+  std::string m_monitor;
+  AudioFormat m_format;
+};
+
+void* PipeWireMonitorLoop::process()
+{
+#ifdef HAVE_PULSEAUDIO
+  const int channels = m_format.channelCount;
+  const int bsize = channels * 2 * PW_MONITOR_FRAMES; // S16LE bites
+  char* buf = new char[bsize];
+  int pa_error = 0;
+  pa_sample_spec ss;
+  ss.format = PA_SAMPLE_S16LE;
+  ss.rate = m_format.sampleRate;
+  ss.channels = (uint8_t)channels;
+  pa_simple* pa = pa_simple_new(NULL, m_name.c_str(), PA_STREAM_RECORD,
+                                m_monitor.c_str(), "record",
+                                &ss, NULL, NULL, &pa_error);
+  if (!pa)
+  {
+    DBG(DBG_ERROR, "PipeWire: pa_simple to '%s' failed: %s\n",
+        m_monitor.c_str(), pa_strerror(pa_error));
+    delete[] buf;
+    return nullptr;
+  }
+  DBG(DBG_INFO, "PipeWire: capturing monitor '%s' rate=%u ch=%d\n",
+      m_monitor.c_str(), ss.rate, channels);
+  OutputStream* out = m_source->m_output; // set at play(), stable in run
+  while (!OS::Thread::is_stopped())
+  {
+    // Server-paced blocking read (realtime by construction).
+    if (pa_simple_read(pa, buf, bsize, &pa_error) < 0)
+    {
+      DBG(DBG_ERROR, "PipeWire: pa_simple_read() failed: %s\n",
+          pa_strerror(pa_error));
+      break;
+    }
+    if (OS::Thread::is_stopped() || !out)
+      break;
+    if (m_source->m_mute)
+      memset(buf, 0, bsize);
+    // Upstream parity: blank killer always runs (even over muted zeros,
+    // where it plants its keepalive blip).
+    m_source->m_blankKiller(buf, channels, PW_MONITOR_FRAMES / 4);
+    if (!m_source->m_mute)
+    {
+      // Undo the sink soft volume exactly (float, 32-bit intermediate):
+      // the slider position drives the speaker itself, so the stream
+      // stays full-scale with no double attenuation.
+      float v = m_source->m_sink->currentVolume();
+      bool m = m_source->m_sink->currentMute();
+      if (!m && v >= 0.001f && v < 0.999f)
+      {
+        float g = 1.0f / v;
+        int16_t* p = reinterpret_cast<int16_t*>(buf);
+        const int n = bsize / 2;
+        for (int i = 0; i < n; ++i)
+        {
+          int32_t x = (int32_t)((float)p[i] * g);
+          if (x > 32767) x = 32767;
+          else if (x < -32768) x = -32768;
+          p[i] = (int16_t)x;
+        }
+      }
+      else if (m)
+        memset(buf, 0, bsize);
+    }
+    if (out->Write(buf, bsize) != bsize)
+    {
+      DBG(DBG_ERROR, "PipeWire: write() failed\n");
+      break;
+    }
+  }
+  delete[] buf;
+  pa_simple_free(pa);
+#else
+  DBG(DBG_ERROR, "PipeWire: monitor capture needs HAVE_PULSEAUDIO\n");
+#endif
+  return nullptr;
+}
+
+PipeWireMonitorSource::PipeWireMonitorSource(const std::string& name,
+                                             const std::string& monitor,
+                                             PipeWireVirtualSink* sink)
+: AudioSource()
+, m_name(name)
+, m_monitor(monitor)
+, m_format(defaultFormat())
+, m_output(nullptr)
+, m_blankKiller(&PCMBlankKillerS16LE)
+, m_sink(sink)
+, m_loop(nullptr)
+{
+}
+
+PipeWireMonitorSource::~PipeWireMonitorSource()
+{
+  stop();
+}
+
+void PipeWireMonitorSource::play(OutputStream* out)
+{
+  if (m_loop)
+    stop();
+  m_output = out;
+  m_loop = new PipeWireMonitorLoop(this, m_name, m_monitor, m_format);
+  m_loop->start();
+}
+
+void PipeWireMonitorSource::stop()
+{
+  if (!m_loop)
+    return;
+  // Blocking read returns in realtime; the next bite ends the loop.
+  m_loop->requestInterruption();
+  m_loop->waitFinished();
+  delete m_loop;
+  m_loop = nullptr;
+  m_output = nullptr;
+}
 
 // Volume worker: debounces sink-node Props changes off the loop thread
 // and forwards the slider position to the registered handler (which maps
@@ -367,44 +509,6 @@ static void ring_write(PipeWireRuntime* rt, const char* data, uint32_t len)
             data, len);
 }
 
-// Claim a free virtual-sink tap (spinlock only around find-and-claim).
-static int tap_attach(PipeWireRuntime* rt)
-{
-  int idx = -1;
-  while (rt->tapLock.test_and_set(std::memory_order_acquire)) { }
-  for (int i = 0; i < PW_MAX_TAPS; ++i)
-  {
-    if (!rt->taps[i].active.load(std::memory_order_relaxed))
-    {
-      idx = i;
-      break;
-    }
-  }
-  if (idx >= 0)
-  {
-    // Reset tap indices while inactive (RT skips inactive taps, and tap
-    // memory outlives sessions, so this is race-free).
-    spa_ringbuffer_init(&rt->taps[idx].ring);
-    rt->taps[idx].active.store(true, std::memory_order_release);
-  }
-  rt->tapLock.clear(std::memory_order_release);
-  return idx;
-}
-
-static void tap_release(PipeWireRuntime* rt, int idx)
-{
-  if (idx < 0 || idx >= PW_MAX_TAPS)
-    return;
-  // Tap memory is sink-owned and outlives sessions, so the RT callback
-  // can never touch freed memory; release is a plain flag store.
-  rt->taps[idx].active.store(false, std::memory_order_release);
-  if (rt->taps[idx].efd >= 0)
-  {
-    uint64_t one = 1;
-    (void)write(rt->taps[idx].efd, &one, sizeof(one));
-  }
-}
-
 // Slider tracking: streams don't get Props param_changed, so subscribe on
 // our own node directly (volume + mute for the slider-to-speaker
 // mapping). Deferred until the server assigns our node id (connect is
@@ -474,30 +578,12 @@ PipeWireSource::PipeWireSource(const std::string& name, const std::string& targe
 , m_format(defaultFormat())
 , m_output(nullptr)
 , m_blankKiller(&PCMBlankKillerS16LE)
-, m_ownsRt(true)
-, m_tapIdx(-1)
 , m_p(nullptr)
 , m_drain(nullptr)
 , m_rt(nullptr)
 {
   if (m_target.empty())
     m_target = env_or("NOSON_PW_TARGET", "");
-}
-
-PipeWireSource::PipeWireSource(PipeWireRuntime* sharedRt, int tapIdx,
-                               const AudioFormat& format)
-: AudioSource()
-, m_name("noson-tap")
-, m_target()
-, m_format(format)
-, m_output(nullptr)
-, m_blankKiller(&PCMBlankKillerS16LE)
-, m_ownsRt(false)
-, m_tapIdx(tapIdx)
-, m_p(nullptr)
-, m_drain(nullptr)
-, m_rt(sharedRt)
-{
 }
 
 PipeWireSource::~PipeWireSource()
@@ -529,7 +615,6 @@ void PipeWireSource::play(OutputStream* out)
   if (m_drain || m_p)
     stop();
   m_output = out;
-  if (m_ownsRt)
   {
     PipeWireRuntime* rt = new PipeWireRuntime();
     memset(rt, 0, sizeof(*rt));
@@ -538,7 +623,6 @@ void PipeWireSource::play(OutputStream* out)
     rt->negotiated.store(false);
     rt->streaming.store(false);
     rt->dropped.store(0);
-    rt->tapLock.clear();
     rt->nodeVolume.store(1.0f);
     rt->nodeMute.store(false);
     rt->vefd = -1; // own-capture has no volume worker
@@ -564,16 +648,6 @@ void PipeWireSource::play(OutputStream* out)
     for (int i = 0; i < 50 && !rt->negotiated.load(); ++i)
       usleep(100 * 1000);
   }
-  else
-  {
-    // Attach mode: feed comes from a virtual-sink tap owned by the sink.
-    if (!m_rt || m_tapIdx < 0 || m_tapIdx >= PW_MAX_TAPS)
-      return;
-    PipeWireTap* tap = &m_rt->taps[m_tapIdx];
-    m_drain = new PipeWireDrain(this, &tap->ring, tap->mem,
-                                PW_TAP_RING_SIZE, tap->efd);
-    m_drain->start();
-  }
 }
 
 void PipeWireSource::stop()
@@ -585,10 +659,7 @@ void PipeWireSource::stop()
   {
     // Wake the drain first so it can't block forever in read()
     m_drain->requestInterruption();
-    if (m_ownsRt)
-      feedEfd = (m_rt && m_rt->efd >= 0) ? m_rt->efd : -1;
-    else if (m_tapIdx >= 0 && m_rt)
-      feedEfd = m_rt->taps[m_tapIdx].efd;
+    feedEfd = (m_rt && m_rt->efd >= 0) ? m_rt->efd : -1;
     if (feedEfd >= 0)
     {
       uint64_t one = 1;
@@ -614,7 +685,7 @@ void PipeWireSource::stop()
     delete m_p;
     m_p = nullptr;
   }
-  if (m_ownsRt && m_rt)
+  if (m_rt)
   {
     if (m_rt->efd >= 0)
       close(m_rt->efd);
@@ -622,12 +693,6 @@ void PipeWireSource::stop()
     if (m_rt->dropped.load())
       DBG(DBG_WARN, "PipeWire: total dropped chunks: %u\n", m_rt->dropped.load());
     delete m_rt;
-    m_rt = nullptr;
-  }
-  else if (!m_ownsRt && m_rt && m_tapIdx >= 0)
-  {
-    tap_release(m_rt, m_tapIdx);
-    m_tapIdx = -1;
     m_rt = nullptr;
   }
   m_output = nullptr;
@@ -638,6 +703,7 @@ PipeWireVirtualSink::PipeWireVirtualSink(const std::string& nodeName,
 : m_name(nodeName.empty() ? "noson" : nodeName)
 , m_desc(description.empty() ? "Sonos" : description)
 , m_format(defaultFormat())
+, m_monitorName(m_name + ".monitor")
 , m_rt(nullptr)
 , m_loop(nullptr)
 , m_volSync(nullptr)
@@ -662,7 +728,6 @@ bool PipeWireVirtualSink::start()
   rt->negotiated.store(false);
   rt->streaming.store(false);
   rt->dropped.store(0);
-  rt->tapLock.clear();
   rt->nodeVolume.store(1.0f);
   rt->nodeMute.store(false);
   rt->vefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -670,24 +735,6 @@ bool PipeWireVirtualSink::start()
   {
     delete rt;
     return false;
-  }
-  for (int i = 0; i < PW_MAX_TAPS; ++i)
-  {
-    rt->taps[i].active.store(false);
-    spa_ringbuffer_init(&rt->taps[i].ring);
-    rt->taps[i].mem = new char[PW_TAP_RING_SIZE];
-    rt->taps[i].efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (rt->taps[i].efd < 0)
-    {
-      for (int j = 0; j <= i; ++j)
-      {
-        delete[] rt->taps[j].mem;
-        if (rt->taps[j].efd >= 0)
-          close(rt->taps[j].efd);
-      }
-      delete rt;
-      return false;
-    }
   }
   m_rt = rt;
   m_loop = new PipeWireLoop(m_name, m_format, "", true, m_desc, rt);
@@ -732,12 +779,6 @@ void PipeWireVirtualSink::stop()
   }
   if (m_rt)
   {
-    for (int i = 0; i < PW_MAX_TAPS; ++i)
-    {
-      delete[] m_rt->taps[i].mem;
-      if (m_rt->taps[i].efd >= 0)
-        close(m_rt->taps[i].efd);
-    }
     if (m_rt->vefd >= 0)
       close(m_rt->vefd);
     delete m_rt;
@@ -756,21 +797,18 @@ bool PipeWireVirtualSink::isRunning() const
   return m_loop && m_loop->isRunning();
 }
 
-bool PipeWireVirtualSink::hasFreeTap() const
+float PipeWireVirtualSink::currentVolume() const
 {
-  if (!isRunning() || !m_rt)
-    return false;
-  for (int i = 0; i < PW_MAX_TAPS; ++i)
-    if (!m_rt->taps[i].active.load(std::memory_order_acquire))
-      return true;
-  return false;
+  if (!m_rt)
+    return 1.0f;
+  return m_rt->nodeVolume.load(std::memory_order_relaxed);
 }
 
-int PipeWireVirtualSink::attachTap()
+bool PipeWireVirtualSink::currentMute() const
 {
-  if (!isRunning() || !m_rt)
-    return -1;
-  return tap_attach(m_rt);
+  if (!m_rt)
+    return false;
+  return m_rt->nodeMute.load(std::memory_order_relaxed);
 }
 
 void* PipeWireLoop::process()
@@ -801,7 +839,7 @@ void* PipeWireLoop::process()
   if (m_sinkMode)
   {
     // Virtual sink: shows up in the OS sound settings as a regular
-    // output device. Apps playing to it feed our taps; nothing is
+    // output device. Sessions capture its monitor source; nothing is
     // audible locally and nothing needs manual wiring.
     props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
@@ -1059,6 +1097,8 @@ void NSROOT::on_process(void* userdata)
 {
   // REALTIME thread: memcpy/arithmetic only. No encode, no mutex,
   // no condvar, no logging on the hot path.
+  // The virtual sink node only dequeues (capture reads its monitor via
+  // pa_simple, like upstream); own-capture feeds the lock-free ring.
   PipeWireRuntime* rt = static_cast<PipeWireRuntime*>(userdata);
   struct pw_buffer* pwbuf = pw_stream_dequeue_buffer(rt->stream);
   if (!pwbuf)
@@ -1067,45 +1107,21 @@ void NSROOT::on_process(void* userdata)
   void* data = buf && buf->n_datas > 0 ? buf->datas[0].data : nullptr;
   uint32_t size = buf && buf->n_datas > 0 && buf->datas[0].chunk
       ? buf->datas[0].chunk->size : 0;
-  if (data && size && rt->negotiated.load())
+  if (data && size && rt->negotiated.load() && !rt->sinkNode)
   {
     // First-buffer marker (fires once): proves the graph delivers audio.
     if (rt->buffers.fetch_add(1) == 0)
-      DBG(DBG_INFO, "PipeWire: first audio buffer, %u bytes%s\n", size,
-          rt->sinkNode ? " (sink)" : "");
+      DBG(DBG_INFO, "PipeWire: first audio buffer, %u bytes\n", size);
     uint32_t fmt = rt->format.info.raw.format;
     if (fmt == SPA_AUDIO_FORMAT_S16_LE || fmt == SPA_AUDIO_FORMAT_S16)
     {
-      if (rt->sinkNode)
-      {
-        // Virtual sink: tee to every active tap (apps must never stall).
-        for (int t = 0; t < PW_MAX_TAPS; ++t)
-        {
-          PipeWireTap* tap = &rt->taps[t];
-          if (!tap->active.load(std::memory_order_acquire))
-            continue;
-          ring_feed(&tap->ring, tap->mem, PW_TAP_RING_SIZE, tap->efd,
-                    nullptr, static_cast<const char*>(data), size);
-        }
-      }
-      else
-        ring_write(rt, static_cast<const char*>(data), size);
+      ring_write(rt, static_cast<const char*>(data), size);
     }
     else if (fmt == SPA_AUDIO_FORMAT_F32_LE || fmt == SPA_AUDIO_FORMAT_F32)
     {
-      // Convert float32 to S16LE in small stack chunks. For the sink
-      // node, undo the Plasma slider's soft volume HERE in float (exact)
-      // instead of downstream in 16-bit (which amplifies rounding noise
-      // up to 70x at low slider positions and sounds broken).
+      // Convert float32 [-1,1] to S16LE in small stack chunks
       const float* in = static_cast<const float*>(data);
       uint32_t ch = rt->format.info.raw.channels;
-      float gain = 1.0f;
-      if (rt->sinkNode)
-      {
-        float v = rt->nodeVolume.load(std::memory_order_relaxed);
-        if (v >= 0.001f && v < 0.999f)
-          gain = 1.0f / v;
-      }
       if (ch > 0 && ch <= 8)
       {
         uint32_t frames = size / sizeof(float) / ch;
@@ -1118,25 +1134,12 @@ void NSROOT::on_process(void* userdata)
             n = PW_DRAIN_FRAMES;
           for (uint32_t i = 0; i < n * ch; ++i)
           {
-            float s = in[done * ch + i] * gain;
+            float s = in[done * ch + i];
             if (s > 1.0f) s = 1.0f;
             if (s < -1.0f) s = -1.0f;
             tmp[i] = (int16_t)(s * 32767.0f);
           }
-          const uint32_t bytes = n * ch * 2;
-          if (rt->sinkNode)
-          {
-            for (int t = 0; t < PW_MAX_TAPS; ++t)
-            {
-              PipeWireTap* tap = &rt->taps[t];
-              if (!tap->active.load(std::memory_order_acquire))
-                continue;
-              ring_feed(&tap->ring, tap->mem, PW_TAP_RING_SIZE, tap->efd,
-                        nullptr, reinterpret_cast<const char*>(tmp), bytes);
-            }
-          }
-          else
-            ring_write(rt, reinterpret_cast<const char*>(tmp), bytes);
+          ring_write(rt, reinterpret_cast<const char*>(tmp), n * ch * 2);
           done += n;
         }
       }

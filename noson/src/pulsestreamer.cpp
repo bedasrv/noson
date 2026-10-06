@@ -49,8 +49,8 @@
 #define PULSESTREAMER_MAX_PB    3
 #define PULSESTREAMER_CHUNK     32752
 #define PULSESTREAMER_TM_MUTE   3000
-#define PULSESTREAMER_TM_MUTE_PW 150
-#define PULSESTREAMER_CHUNK_PW  8192
+#define PULSESTREAMER_TM_MUTE_PW 3000
+#define PULSESTREAMER_CHUNK_PW  32752
 #define PA_SINK_NAME            "noson"
 #define PA_CLIENT_NAME          PA_SINK_NAME
 
@@ -461,7 +461,7 @@ void PulseStreamer::streamSinkPW(handle * handle)
   const char* testTone = std::getenv("NOSON_TEST_TONE");
   const bool useChirp = testTone && strcmp(testTone, "chirp") == 0;
   const bool useSink = !useChirp && target.empty() && EnsureVirtualSink()
-      && m_pwSink->hasFreeTap();
+      && m_pwSink->isRunning();
   DBG(DBG_INFO, "%s: %s target='%s'\n", __FUNCTION__,
       useChirp ? "chirp test tone" : (useSink ? "virtual sink" : "pipewire capture"),
       useChirp ? "<internal>" : (target.empty() && useSink ? "<sonos sink>" :
@@ -469,6 +469,7 @@ void PulseStreamer::streamSinkPW(handle * handle)
 
   AudioSource* audioSource = nullptr;
   PipeWireSource* pwSource = nullptr;
+  PipeWireMonitorSource* pwMonSource = nullptr;
   ChirpSource* chirpSource = nullptr;
   if (useChirp)
   {
@@ -477,18 +478,12 @@ void PulseStreamer::streamSinkPW(handle * handle)
   }
   else if (useSink)
   {
-    int tap = m_pwSink->attachTap();
-    if (tap < 0)
-    {
-      DBG(DBG_ERROR, "%s: no free virtual-sink tap\n", __FUNCTION__);
-      TraceResponseStatus(503);
-      reply.CloseReply(WS_STATUS_503_Service_Unavailable);
-      *m_playbackCount.GetExclusive() -= 1;
-      return;
-    }
-    pwSource = new PipeWireSource(m_pwSink->runtime(), tap,
-                                  m_pwSink->format());
-    audioSource = pwSource;
+    // Blocking monitor capture (upstream architecture): server-paced
+    // pa_simple read of the sink's monitor, no RT, no tap rings.
+    pwMonSource = new PipeWireMonitorSource(PA_CLIENT_NAME,
+                                            m_pwSink->monitorName(),
+                                            m_pwSink);
+    audioSource = pwMonSource;
   }
   else
   {

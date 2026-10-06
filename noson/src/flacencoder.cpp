@@ -33,7 +33,7 @@ static int GetFlacLevel()
     if (v >= 0 && v <= 8)
       return v;
   }
-  return 0; // low-latency default (was 5)
+  return 5; // upstream parity (override with NOSON_FLAC_LEVEL)
 }
 
 static bool GetFlacVerify()
@@ -41,7 +41,7 @@ static bool GetFlacVerify()
   const char* e = std::getenv("NOSON_FLAC_VERIFY");
   if (e && *e)
     return atoi(e) != 0;
-  return false; // skip verify for lower CPU/latency (was true)
+  return true; // upstream parity (override with NOSON_FLAC_VERIFY=0)
 }
 
 using namespace NSROOT;
