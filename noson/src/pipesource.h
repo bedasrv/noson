@@ -17,6 +17,8 @@
 #include "audiosource.h"
 
 #include <atomic>
+#include <functional>
+#include <mutex>
 #include <string>
 
 struct spa_pod;
@@ -86,7 +88,13 @@ private:
 // with no active playback the audio is dropped (apps never stall).
 class PipeWireVirtualSink
 {
+  friend class PipeWireVolumeSync;
 public:
+  // Handler: Plasma slider moved. volume01 is the PipeWire linear volume
+  // (1.0 == 100%, cubic-mapped from the slider), mute the node mute flag.
+  // Called from a worker thread (never realtime); blocking OK.
+  typedef std::function<void(float volume01, bool mute)> VolumeHandler;
+
   explicit PipeWireVirtualSink(const std::string& nodeName,
                                const std::string& description);
   ~PipeWireVirtualSink();
@@ -98,6 +106,7 @@ public:
   int attachTap();
   struct PipeWireRuntime* runtime() const { return m_rt; }
   AudioFormat format() const { return m_format; }
+  void setVolumeHandler(VolumeHandler h);
 
 private:
   std::string m_name;
@@ -105,6 +114,9 @@ private:
   AudioFormat m_format;
   struct PipeWireRuntime* m_rt;
   class PipeWireLoop* m_loop;
+  class PipeWireVolumeSync* m_volSync;
+  VolumeHandler m_volHandler;
+  std::mutex m_volMutex;
 };
 
 }

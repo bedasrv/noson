@@ -18,7 +18,10 @@
 
 #include <pipewire/pipewire.h>
 #include <pipewire/loop.h>
+#include <pipewire/core.h>
+#include <pipewire/node.h>
 #include <spa/param/audio/format-utils.h>
+#include <spa/param/props.h>
 #include <spa/utils/ringbuffer.h>
 #include <spa/utils/result.h>
 
@@ -73,6 +76,17 @@ struct PipeWireRuntime
   // while the sink lives, so the RT callback needs no locks)
   PipeWireTap taps[PW_MAX_TAPS];
   std::atomic_flag tapLock;
+  // OS volume of the sink node (Plasma slider): linear 1.0 == 100%.
+  // Updated from Props param events (loop thread), read by the volume
+  // worker and by drains for PCM unscaling. Defaults to full scale.
+  std::atomic<float> nodeVolume;
+  std::atomic<bool> nodeMute;
+  int vefd; // signalled on every Props volume/mute change
+  // node-proxy Props subscription (sink mode): our stream's param_changed
+  // does not deliver Props, so we subscribe on our own node directly.
+  struct pw_registry* registry;
+  struct pw_proxy* nodeProxy;
+  struct spa_hook nodeListener;
 };
 
 class PipeWireLoop : private OS::Thread
@@ -126,6 +140,156 @@ private:
   char* m_mem;
   uint32_t m_size;
   int m_efd;
+};
+
+// Volume worker: debounces sink-node Props changes off the loop thread
+// and forwards the slider position to the registered handler (which maps
+// it onto the Sonos speaker volume). Never runs in realtime context.
+class PipeWireVolumeSync : private OS::Thread
+{
+public:
+  PipeWireVolumeSync(PipeWireVirtualSink* sink, PipeWireRuntime* rt)
+  : OS::Thread(), m_sink(sink), m_rt(rt)
+  , m_lastVol(-1.0f), m_lastMute(false), m_haveLast(false) { }
+  virtual ~PipeWireVolumeSync() override
+  {
+    if (is_running())
+      stop_thread(true);
+  }
+  bool isRunning() { return OS::Thread::is_running(); }
+  void start() { OS::Thread::start_thread(true); }
+  void requestInterruption() { OS::Thread::stop_thread(false); }
+  bool waitFinished() { return OS::Thread::wait_thread((unsigned)-1); }
+private:
+  void* process() override;
+  PipeWireVirtualSink* m_sink;
+  PipeWireRuntime* m_rt;
+  float m_lastVol;
+  bool m_lastMute;
+  bool m_haveLast;
+};
+
+void* PipeWireVolumeSync::process()
+{
+  // Normal-priority worker: wait for slider changes, debounce, forward.
+  while (!OS::Thread::is_stopped())
+  {
+    uint64_t cnt = 0;
+    ssize_t r = read(m_rt->vefd, &cnt, sizeof(cnt));
+    if (r <= 0)
+    {
+      if (errno == EINTR)
+        continue;
+      if (errno == EAGAIN)
+      {
+        usleep(5000);
+        continue;
+      }
+      break; // vefd closed or stopped
+    }
+    // Coalesce rapid drags: settle 150ms before forwarding.
+    usleep(150 * 1000);
+    if (OS::Thread::is_stopped())
+      break;
+    // Drain any further pending signals (still dragging).
+    uint64_t more = 0;
+    while (read(m_rt->vefd, &more, sizeof(more)) > 0) { }
+    float v = m_rt->nodeVolume.load(std::memory_order_relaxed);
+    bool m = m_rt->nodeMute.load(std::memory_order_relaxed);
+    if (m_haveLast && v == m_lastVol && m == m_lastMute)
+      continue;
+    m_lastVol = v;
+    m_lastMute = m;
+    m_haveLast = true;
+    PipeWireVirtualSink::VolumeHandler h;
+    {
+      std::lock_guard<std::mutex> lk(m_sink->m_volMutex);
+      h = m_sink->m_volHandler;
+    }
+    if (h)
+      h(v, m);
+    else
+      DBG(DBG_INFO, "PipeWire: sink volume %.3f mute=%d (no handler)\n", v, (int)m);
+  }
+  return nullptr;
+}
+
+// Plasma slider moved: Props carry "volume" (float array, linear,
+// 1.0 == 100%) and "mute" (bool). Runs on the loop thread, so only
+// store atomics + signal; the volume worker does the rest.
+static void sink_props_changed(PipeWireRuntime* rt, const struct spa_pod* param)
+{
+  if (!spa_pod_is_object(param))
+    return;
+  const struct spa_pod_object* obj =
+      reinterpret_cast<const struct spa_pod_object*>(param);
+  struct spa_pod_prop* prop = nullptr;
+  bool changed = false;
+  SPA_POD_OBJECT_FOREACH(obj, prop)
+  {
+    float nv = -1.0f;
+    if (prop->key == SPA_PROP_volume && spa_pod_is_float(&prop->value))
+    {
+      // Scalar combined volume (this is what the slider drives).
+      nv = reinterpret_cast<const struct spa_pod_float*>(&prop->value)->value;
+    }
+    else if (prop->key == SPA_PROP_channelVolumes &&
+             spa_pod_is_array(&prop->value))
+    {
+      const struct spa_pod* arr = &prop->value;
+      uint32_t n = SPA_POD_ARRAY_N_VALUES(arr);
+      if (n > 0 && SPA_POD_ARRAY_VALUE_SIZE(arr) == sizeof(float))
+      {
+        const float* v =
+            reinterpret_cast<const float*>(SPA_POD_ARRAY_VALUES(arr));
+        nv = v[0];
+        for (uint32_t i = 1; i < n; ++i)
+          if (v[i] > nv)
+            nv = v[i];
+      }
+    }
+    if (nv >= 0.0f)
+    {
+      if (nv != rt->nodeVolume.load(std::memory_order_relaxed))
+      {
+        rt->nodeVolume.store(nv, std::memory_order_relaxed);
+        changed = true;
+      }
+    }
+    else if (prop->key == SPA_PROP_mute && spa_pod_is_bool(&prop->value))
+    {
+      bool nm = reinterpret_cast<const struct spa_pod_bool*>(&prop->value)->value != 0;
+      if (nm != rt->nodeMute.load(std::memory_order_relaxed))
+      {
+        rt->nodeMute.store(nm, std::memory_order_relaxed);
+        changed = true;
+      }
+    }
+  }
+  if (changed)
+    DBG(DBG_INFO, "PipeWire: sink volume %.3f mute=%d\n",
+        rt->nodeVolume.load(), (int)rt->nodeMute.load());
+  if (changed && rt->vefd >= 0)
+  {
+    uint64_t one = 1;
+    (void)write(rt->vefd, &one, sizeof(one));
+  }
+}
+
+static void on_node_param(void* userdata, int seq, uint32_t id,
+                          uint32_t index, uint32_t next,
+                          const struct spa_pod* param)
+{
+  (void)seq; (void)index; (void)next;
+  PipeWireRuntime* rt = static_cast<PipeWireRuntime*>(userdata);
+  if (id == SPA_PARAM_Props && rt->sinkNode)
+    sink_props_changed(rt, param);
+}
+
+static const struct pw_node_events node_events = {
+  PW_VERSION_NODE_EVENTS,
+  .info = nullptr,
+  .param = on_node_param,
 };
 
 static const struct pw_stream_events stream_events = {
@@ -241,6 +405,36 @@ static void tap_release(PipeWireRuntime* rt, int idx)
   }
 }
 
+// Slider tracking: streams don't get Props param_changed, so subscribe on
+// our own node directly (volume + mute for the slider-to-speaker
+// mapping). Deferred until the server assigns our node id (connect is
+// async); runs on the loop thread via the driver tick.
+static void ensure_props_subscription(PipeWireRuntime* rt)
+{
+  if (rt->nodeProxy || !rt->stream)
+    return;
+  uint32_t nid = pw_stream_get_node_id(rt->stream);
+  if (nid == PW_ID_ANY)
+    return;
+  if (!rt->registry)
+  {
+    struct pw_core* core = pw_stream_get_core(rt->stream);
+    if (core)
+      rt->registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+    if (!rt->registry)
+      return;
+  }
+  rt->nodeProxy = (struct pw_proxy*)pw_registry_bind(
+      rt->registry, nid, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
+  if (!rt->nodeProxy)
+    return;
+  pw_node_add_listener((struct pw_node*)rt->nodeProxy,
+                       &rt->nodeListener, &node_events, rt);
+  uint32_t ids[] = { SPA_PARAM_Props };
+  int res = pw_node_subscribe_params((struct pw_node*)rt->nodeProxy, ids, 1);
+  DBG(DBG_INFO, "PipeWire: subscribed node %u Props (res=%d)\n", nid, res);
+}
+
 // Graph driver tick (loop thread): when our sink node is elected driver
 // (i.e. no hardware runs), pump the graph so players linked to the node
 // get scheduled even with everything else suspended. Thread-safe: the
@@ -249,6 +443,7 @@ static void driver_tick(void* userdata, uint64_t expirations)
 {
   (void)expirations;
   PipeWireRuntime* rt = static_cast<PipeWireRuntime*>(userdata);
+  ensure_props_subscription(rt);
   if (rt->stream && pw_stream_is_driving(rt->stream))
     pw_stream_trigger_process(rt->stream);
 }
@@ -348,6 +543,9 @@ void PipeWireSource::play(OutputStream* out)
     rt->streaming.store(false);
     rt->dropped.store(0);
     rt->tapLock.clear();
+    rt->nodeVolume.store(1.0f);
+    rt->nodeMute.store(false);
+    rt->vefd = -1; // own-capture has no volume worker
     rt->ringmem = new char[PW_RING_SIZE];
     spa_ringbuffer_init(&rt->ring);
     rt->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -446,6 +644,7 @@ PipeWireVirtualSink::PipeWireVirtualSink(const std::string& nodeName,
 , m_format(defaultFormat())
 , m_rt(nullptr)
 , m_loop(nullptr)
+, m_volSync(nullptr)
 {
 }
 
@@ -468,6 +667,14 @@ bool PipeWireVirtualSink::start()
   rt->streaming.store(false);
   rt->dropped.store(0);
   rt->tapLock.clear();
+  rt->nodeVolume.store(1.0f);
+  rt->nodeMute.store(false);
+  rt->vefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (rt->vefd < 0)
+  {
+    delete rt;
+    return false;
+  }
   for (int i = 0; i < PW_MAX_TAPS; ++i)
   {
     rt->taps[i].active.store(false);
@@ -489,6 +696,8 @@ bool PipeWireVirtualSink::start()
   m_rt = rt;
   m_loop = new PipeWireLoop(m_name, m_format, "", true, m_desc, rt);
   m_loop->start();
+  m_volSync = new PipeWireVolumeSync(this, rt);
+  m_volSync->start();
   for (int i = 0; i < 50 && !rt->negotiated.load(); ++i)
     usleep(100 * 1000);
   if (!m_loop->isRunning())
@@ -508,9 +717,23 @@ void PipeWireVirtualSink::stop()
   if (m_rt && m_rt->loop)
     pw_main_loop_quit(m_rt->loop);
   m_loop->requestInterruption();
+  if (m_volSync)
+    m_volSync->requestInterruption();
+  if (m_rt && m_rt->vefd >= 0)
+  {
+    // Wake the volume worker so it can't block forever in read().
+    uint64_t one = 1;
+    (void)write(m_rt->vefd, &one, sizeof(one));
+  }
   m_loop->waitFinished();
   delete m_loop;
   m_loop = nullptr;
+  if (m_volSync)
+  {
+    m_volSync->waitFinished();
+    delete m_volSync;
+    m_volSync = nullptr;
+  }
   if (m_rt)
   {
     for (int i = 0; i < PW_MAX_TAPS; ++i)
@@ -519,9 +742,17 @@ void PipeWireVirtualSink::stop()
       if (m_rt->taps[i].efd >= 0)
         close(m_rt->taps[i].efd);
     }
+    if (m_rt->vefd >= 0)
+      close(m_rt->vefd);
     delete m_rt;
     m_rt = nullptr;
   }
+}
+
+void PipeWireVirtualSink::setVolumeHandler(VolumeHandler h)
+{
+  std::lock_guard<std::mutex> lk(m_volMutex);
+  m_volHandler = h;
 }
 
 bool PipeWireVirtualSink::isRunning() const
@@ -670,6 +901,10 @@ void* PipeWireLoop::process()
       struct timespec iv = {0, 5000000};
       pw_loop_update_timer(ploop, timer, &val, &iv, false);
     }
+    // Slider tracking is set up lazily from the driver tick (node id is
+    // only valid once the server creates the node).
+    rt->registry = nullptr;
+    rt->nodeProxy = nullptr;
   }
 
   DBG(DBG_INFO, "PipeWire: %s target='%s' latency=%s rate=%u ch=%u\n",
@@ -683,6 +918,16 @@ void* PipeWireLoop::process()
 
   if (timer && ploop)
     pw_loop_destroy_source(ploop, timer);
+  if (rt->nodeProxy)
+  {
+    pw_proxy_destroy(rt->nodeProxy);
+    rt->nodeProxy = nullptr;
+  }
+  if (rt->registry)
+  {
+    pw_proxy_destroy((struct pw_proxy*)rt->registry);
+    rt->registry = nullptr;
+  }
   if (rt->stream)
   {
     pw_stream_destroy(rt->stream);
@@ -775,6 +1020,27 @@ int PipeWireDrain::drainAvailable(char* buf, int bite, int channels)
       m_source->m_blankKiller(buf, channels, (len / bpf) / 4);
     // (a 1-frame tail skips the killer: it unconditionally touches
     // 2 frames, which would overflow a 1-frame buffer)
+    // Unscale the sink-node soft volume: PipeWire applies the Plasma
+    // slider as digital gain before our buffers arrive, but the slider
+    // is forwarded to the Sonos speaker itself (volume worker), so the
+    // stream must stay at full scale. Gain restores it within 1 LSB.
+    if (m_source->m_rt)
+    {
+      float v = m_source->m_rt->nodeVolume.load(std::memory_order_relaxed);
+      if (v >= 0.001f && v < 0.999f)
+      {
+        float g = 1.0f / v;
+        int16_t* s = reinterpret_cast<int16_t*>(buf);
+        int n = len / 2;
+        for (int i = 0; i < n; ++i)
+        {
+          int32_t x = (int32_t)(s[i] * g);
+          if (x > 32767) x = 32767;
+          else if (x < -32768) x = -32768;
+          s[i] = (int16_t)x;
+        }
+      }
+    }
     if (out->Write(buf, len) != len)
     {
       DBG(DBG_ERROR, "PipeWire: write() failed\n");
@@ -787,10 +1053,20 @@ int PipeWireDrain::drainAvailable(char* buf, int bite, int channels)
   return produced;
 }
 
+
 void NSROOT::on_param_changed(void* userdata, uint32_t id, const struct spa_pod* param)
 {
   PipeWireRuntime* rt = static_cast<PipeWireRuntime*>(userdata);
-  if (param == nullptr || id != SPA_PARAM_Format)
+  if (param == nullptr)
+    return;
+  if (id == SPA_PARAM_Props && rt->sinkNode)
+  {
+    // Kept for setups that do deliver Props on streams; normally the
+    // node-proxy subscription below handles this.
+    sink_props_changed(rt, param);
+    return;
+  }
+  if (id != SPA_PARAM_Format)
     return;
   uint32_t mt, st;
   if (spa_format_parse(param, &mt, &st) < 0)

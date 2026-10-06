@@ -22,6 +22,8 @@
 #include "requestbroker.h"
 #include "locked.h"
 
+#include <functional>
+
 #define PULSESTREAMER_CNAME   "pulse"
 #define PULSESTREAMER_URI     "/music/pulse.flac"
 
@@ -37,6 +39,11 @@ public:
   ~PulseStreamer() override;
   virtual bool Initialize() override;
   virtual bool HandleRequest(handle * handle) override;
+  // Forward Plasma-slider changes to the Sonos speaker(s). Stashed until
+  // the virtual sink exists. Signature matches
+  // PipeWireVirtualSink::VolumeHandler (volume01 linear 1.0==100%, mute).
+  typedef std::function<void(float volume01, bool mute)> VolumeHandler;
+  void SetVolumeHandler(VolumeHandler h);
 
   const char * CommonName() override { return PULSESTREAMER_CNAME; }
   RequestBroker::ResourcePtr GetResource(const std::string& title) override;
@@ -56,6 +63,8 @@ private:
   Locked<int> m_playbackCount;
   // persistent PipeWire virtual sink ("Sonos" output device), if enabled
   PipeWireVirtualSink* m_pwSink;
+  // stashed slider-to-speaker handler, applied when the sink is created
+  VolumeHandler m_volHandler;
 
   std::string GetPASink();
   void FreePASink();

@@ -159,6 +159,8 @@ bool PulseStreamer::EnsureVirtualSink()
   const char* nm = std::getenv("NOSON_SINK_NAME");
   const char* ds = std::getenv("NOSON_SINK_DESC");
   m_pwSink = new PipeWireVirtualSink(nm ? nm : "", ds ? ds : "");
+  if (m_volHandler)
+    m_pwSink->setVolumeHandler(m_volHandler);
   if (!m_pwSink->start())
   {
     DBG(DBG_ERROR, "%s: virtual sink unavailable\n", __FUNCTION__);
@@ -169,6 +171,17 @@ bool PulseStreamer::EnsureVirtualSink()
   return true;
 #else
   return false;
+#endif
+}
+
+void PulseStreamer::SetVolumeHandler(VolumeHandler h)
+{
+#ifdef HAVE_PIPEWIRE
+  m_volHandler = h;
+  if (m_pwSink)
+    m_pwSink->setVolumeHandler(h);
+#else
+  (void)h;
 #endif
 }
 
