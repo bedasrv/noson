@@ -435,6 +435,26 @@ static void ensure_props_subscription(PipeWireRuntime* rt)
   DBG(DBG_INFO, "PipeWire: subscribed node %u Props (res=%d)\n", nid, res);
 }
 
+// Congestion guard: with hardware running, its cycles plus our trigger
+// ticks would pump audio ~2x realtime (measured 2.1x -> broken Sonos
+// playback). The tap rings reveal over-production (drain consumes
+// realtime), so skip ticks while any active tap holds buffered audio.
+static bool taps_congested(PipeWireRuntime* rt)
+{
+  for (int t = 0; t < PW_MAX_TAPS; ++t)
+  {
+    PipeWireTap* tap = &rt->taps[t];
+    if (!tap->active.load(std::memory_order_acquire))
+      continue;
+    uint32_t wi = 0, ri = 0;
+    int32_t w = spa_ringbuffer_get_write_index(&tap->ring, &wi);
+    int32_t r = spa_ringbuffer_get_read_index(&tap->ring, &ri);
+    if ((w - r) > (int32_t)(PW_TAP_RING_SIZE / 4))
+      return true;
+  }
+  return false;
+}
+
 // Graph driver tick (loop thread): when our sink node is elected driver
 // (i.e. no hardware runs), pump the graph so players linked to the node
 // get scheduled even with everything else suspended. Thread-safe: the
@@ -444,7 +464,7 @@ static void driver_tick(void* userdata, uint64_t expirations)
   (void)expirations;
   PipeWireRuntime* rt = static_cast<PipeWireRuntime*>(userdata);
   ensure_props_subscription(rt);
-  if (rt->stream && pw_stream_is_driving(rt->stream))
+  if (rt->stream && pw_stream_is_driving(rt->stream) && !taps_congested(rt))
     pw_stream_trigger_process(rt->stream);
 }
 
