@@ -856,7 +856,11 @@ void* PipeWireLoop::process()
   uint8_t buffer[1024];
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
   struct spa_audio_info_raw raw;
-  raw.format = SPA_AUDIO_FORMAT_S16_LE;
+  // Sink mode negotiates float32: PipeWire applies the Plasma slider as
+  // soft volume, and in float that scaling is lossless, so we can undo
+  // it exactly (see on_process) instead of amplifying 16-bit rounding
+  // noise. Capture mode stays S16 (native mic format, volume unused).
+  raw.format = m_sinkMode ? SPA_AUDIO_FORMAT_F32_LE : SPA_AUDIO_FORMAT_S16_LE;
   raw.rate = m_format.sampleRate;
   raw.channels = m_format.channelCount;
   raw.flags = 0;
@@ -1020,27 +1024,8 @@ int PipeWireDrain::drainAvailable(char* buf, int bite, int channels)
       m_source->m_blankKiller(buf, channels, (len / bpf) / 4);
     // (a 1-frame tail skips the killer: it unconditionally touches
     // 2 frames, which would overflow a 1-frame buffer)
-    // Unscale the sink-node soft volume: PipeWire applies the Plasma
-    // slider as digital gain before our buffers arrive, but the slider
-    // is forwarded to the Sonos speaker itself (volume worker), so the
-    // stream must stay at full scale. Gain restores it within 1 LSB.
-    if (m_source->m_rt)
-    {
-      float v = m_source->m_rt->nodeVolume.load(std::memory_order_relaxed);
-      if (v >= 0.001f && v < 0.999f)
-      {
-        float g = 1.0f / v;
-        int16_t* s = reinterpret_cast<int16_t*>(buf);
-        int n = len / 2;
-        for (int i = 0; i < n; ++i)
-        {
-          int32_t x = (int32_t)(s[i] * g);
-          if (x > 32767) x = 32767;
-          else if (x < -32768) x = -32768;
-          s[i] = (int16_t)x;
-        }
-      }
-    }
+    // Note: sink-node soft-volume compensation happens in float in the
+    // RT callback (exact); nothing is scaled back here.
     if (out->Write(buf, len) != len)
     {
       DBG(DBG_ERROR, "PipeWire: write() failed\n");
@@ -1118,9 +1103,19 @@ void NSROOT::on_process(void* userdata)
     }
     else if (fmt == SPA_AUDIO_FORMAT_F32_LE || fmt == SPA_AUDIO_FORMAT_F32)
     {
-      // Convert float32 [-1,1] to S16LE in small stack chunks
+      // Convert float32 to S16LE in small stack chunks. For the sink
+      // node, undo the Plasma slider's soft volume HERE in float (exact)
+      // instead of downstream in 16-bit (which amplifies rounding noise
+      // up to 70x at low slider positions and sounds broken).
       const float* in = static_cast<const float*>(data);
       uint32_t ch = rt->format.info.raw.channels;
+      float gain = 1.0f;
+      if (rt->sinkNode)
+      {
+        float v = rt->nodeVolume.load(std::memory_order_relaxed);
+        if (v >= 0.001f && v < 0.999f)
+          gain = 1.0f / v;
+      }
       if (ch > 0 && ch <= 8)
       {
         uint32_t frames = size / sizeof(float) / ch;
@@ -1133,10 +1128,10 @@ void NSROOT::on_process(void* userdata)
             n = PW_DRAIN_FRAMES;
           for (uint32_t i = 0; i < n * ch; ++i)
           {
-            float v = in[done * ch + i];
-            if (v > 1.0f) v = 1.0f;
-            if (v < -1.0f) v = -1.0f;
-            tmp[i] = (int16_t)(v * 32767.0f);
+            float s = in[done * ch + i] * gain;
+            if (s > 1.0f) s = 1.0f;
+            if (s < -1.0f) s = -1.0f;
+            tmp[i] = (int16_t)(s * 32767.0f);
           }
           const uint32_t bytes = n * ch * 2;
           if (rt->sinkNode)
