@@ -37,6 +37,7 @@
 #endif
 
 #include <cassert>
+#include <cmath>
 
 using namespace NSROOT;
 
@@ -98,6 +99,14 @@ Player::Player(const ZonePlayerPtr& zonePlayer)
 
 Player::~Player()
 {
+  // Drop our slider-to-speaker mapping if we own it, so a later drag
+  // can never reach this dying zone player.
+#if defined(HAVE_PULSEAUDIO) || defined(HAVE_PIPEWIRE)
+  RequestBrokerPtr rb = m_eventHandler.GetRequestBroker(PULSESTREAMER_CNAME);
+  PulseStreamer* ps = rb ? static_cast<PulseStreamer*>(rb.get()) : nullptr;
+  if (ps)
+    ps->ClearVolumeHandler(this);
+#endif
   SAFE_DELETE(m_contentDirectory);
   SAFE_DELETE(m_AVTransport);
   SAFE_DELETE(m_deviceProperties);
@@ -504,6 +513,34 @@ bool Player::PlayPulse()
 #endif
   if (res)
   {
+#ifdef HAVE_PIPEWIRE
+    // PipeWire path: the Plasma slider on our virtual sink IS this
+    // speaker's volume. Map slider position onto the zone (cubic root
+    // inverts the slider's cubic mapping; PCM stays full-scale thanks
+    // to drain unscaling). Last zone to start pulse wins.
+    RequestBrokerPtr pbrb = m_eventHandler.GetRequestBroker(PULSESTREAMER_CNAME);
+    if (PulseStreamer* ps = pbrb ? static_cast<PulseStreamer*>(pbrb.get()) : nullptr)
+    {
+      const std::string uuid(m_uuid);
+      ps->SetVolumeHandler([this, uuid, ps](float v, bool mute) {
+        if (!ps->IsStreaming())
+          return;
+        if (mute)
+        {
+          SetMute(uuid, 1);
+          return;
+        }
+        SetMute(uuid, 0);
+        float c = v < 0.0f ? 0.0f : v;
+        int sv = c >= 1.0f ? 100 : (int)(100.0f * cbrtf(c) + 0.5f);
+        if (sv > 100)
+          sv = 100;
+        else if (sv < 0)
+          sv = 0;
+        SetVolume(uuid, (uint8_t)sv);
+      }, this);
+    }
+#endif
     bool hasParam = (res->uri.find("?") != std::string::npos);
     // define the stream URL for the local handler
     std::string streamURL;

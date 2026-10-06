@@ -97,6 +97,7 @@ PulseStreamer::PulseStreamer(RequestBroker * imageService /*= nullptr*/)
 , m_sinkIndex(PA_INVALID_INDEX)
 , m_playbackCount(0)
 , m_pwSink(nullptr)
+, m_volOwner(nullptr)
 {
   // delegate image download to imageService
   ResourcePtr img(nullptr);
@@ -174,14 +175,30 @@ bool PulseStreamer::EnsureVirtualSink()
 #endif
 }
 
-void PulseStreamer::SetVolumeHandler(VolumeHandler h)
+void PulseStreamer::SetVolumeHandler(VolumeHandler h, const void* owner)
 {
 #ifdef HAVE_PIPEWIRE
   m_volHandler = h;
+  m_volOwner = owner;
   if (m_pwSink)
     m_pwSink->setVolumeHandler(h);
 #else
-  (void)h;
+  (void)h; (void)owner;
+#endif
+}
+
+void PulseStreamer::ClearVolumeHandler(const void* owner)
+{
+#ifdef HAVE_PIPEWIRE
+  if (m_volOwner == owner)
+  {
+    m_volHandler = nullptr;
+    m_volOwner = nullptr;
+    if (m_pwSink)
+      m_pwSink->setVolumeHandler(nullptr);
+  }
+#else
+  (void)owner;
 #endif
 }
 

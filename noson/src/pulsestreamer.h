@@ -43,7 +43,9 @@ public:
   // the virtual sink exists. Signature matches
   // PipeWireVirtualSink::VolumeHandler (volume01 linear 1.0==100%, mute).
   typedef std::function<void(float volume01, bool mute)> VolumeHandler;
-  void SetVolumeHandler(VolumeHandler h);
+  void SetVolumeHandler(VolumeHandler h, const void* owner = nullptr);
+  void ClearVolumeHandler(const void* owner);
+  bool IsStreaming() { return m_playbackCount.Load() > 0; }
 
   const char * CommonName() override { return PULSESTREAMER_CNAME; }
   RequestBroker::ResourcePtr GetResource(const std::string& title) override;
@@ -63,8 +65,11 @@ private:
   Locked<int> m_playbackCount;
   // persistent PipeWire virtual sink ("Sonos" output device), if enabled
   PipeWireVirtualSink* m_pwSink;
-  // stashed slider-to-speaker handler, applied when the sink is created
+  // stashed slider-to-speaker handler, applied when the sink is created.
+  // m_volOwner identifies the registering zone player; only it (or
+  // its destruction) may replace/clear the handler.
   VolumeHandler m_volHandler;
+  const void* m_volOwner;
 
   std::string GetPASink();
   void FreePASink();
