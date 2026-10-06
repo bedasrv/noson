@@ -207,29 +207,12 @@ void* PipeWireMonitorLoop::process()
     // Upstream parity: blank killer always runs (even over muted zeros,
     // where it plants its keepalive blip).
     m_source->m_blankKiller(buf, channels, PW_MONITOR_FRAMES / 4);
-    if (!m_source->m_mute)
-    {
-      // Undo the sink soft volume exactly (float, 32-bit intermediate):
-      // the slider position drives the speaker itself, so the stream
-      // stays full-scale with no double attenuation.
-      float v = m_source->m_sink->currentVolume();
-      bool m = m_source->m_sink->currentMute();
-      if (!m && v >= 0.001f && v < 0.999f)
-      {
-        float g = 1.0f / v;
-        int16_t* p = reinterpret_cast<int16_t*>(buf);
-        const int n = bsize / 2;
-        for (int i = 0; i < n; ++i)
-        {
-          int32_t x = (int32_t)((float)p[i] * g);
-          if (x > 32767) x = 32767;
-          else if (x < -32768) x = -32768;
-          p[i] = (int16_t)x;
-        }
-      }
-      else if (m)
-        memset(buf, 0, bsize);
-    }
+    if (!m_source->m_mute && m_source->m_sink->currentMute())
+      memset(buf, 0, bsize);
+    // NOTE: no soft-volume unscale here. The monitor tap is pre-fader
+    // (full-scale regardless of slider); the slider position drives the
+    // speaker itself via the volume handler, so any gain here only
+    // flat-tops the stream (measured 80% clipped at low slider).
     if (out->Write(buf, bsize) != bsize)
     {
       DBG(DBG_ERROR, "PipeWire: write() failed\n");
