@@ -45,6 +45,14 @@ using namespace NSROOT;
 namespace NSROOT
 {
 
+struct PipeWireTap
+{
+  std::atomic<bool> active;
+  struct spa_ringbuffer ring;
+  char* mem;
+  int efd;
+};
+
 struct PipeWireRuntime
 {
   struct pw_main_loop* loop;
@@ -53,18 +61,26 @@ struct PipeWireRuntime
   std::atomic<bool> negotiated;
   std::atomic<bool> streaming;
   PipeWireSource* source;
+  bool sinkNode;
   // lock-free PCM handoff (RT producer, drain consumer)
   struct spa_ringbuffer ring;
   char* ringmem;
   int efd;
   std::atomic<unsigned> dropped;
+  // virtual-sink taps: fixed slots, sink-owned memory (never freed
+  // while the sink lives, so the RT callback needs no locks)
+  PipeWireTap taps[PW_MAX_TAPS];
+  std::atomic_flag tapLock;
 };
 
 class PipeWireLoop : private OS::Thread
 {
 public:
-  explicit PipeWireLoop(PipeWireSource* source, PipeWireRuntime* rt)
-  : OS::Thread(), m_source(source), m_rt(rt) { }
+  PipeWireLoop(const std::string& name, const AudioFormat& format,
+               const std::string& target, bool sinkMode,
+               const std::string& sinkDesc, PipeWireRuntime* rt)
+  : OS::Thread(), m_name(name), m_format(format), m_target(target)
+  , m_sinkMode(sinkMode), m_sinkDesc(sinkDesc), m_rt(rt) { }
   virtual ~PipeWireLoop() override
   {
     if (is_running())
@@ -76,15 +92,21 @@ public:
   bool waitFinished() { return OS::Thread::wait_thread((unsigned)-1); }
 private:
   void* process() override;
-  PipeWireSource* m_source;
+  std::string m_name;
+  AudioFormat m_format;
+  std::string m_target;
+  bool m_sinkMode;
+  std::string m_sinkDesc;
   PipeWireRuntime* m_rt;
 };
 
 class PipeWireDrain : private OS::Thread
 {
 public:
-  explicit PipeWireDrain(PipeWireSource* source, PipeWireRuntime* rt)
-  : OS::Thread(), m_source(source), m_rt(rt) { }
+  PipeWireDrain(PipeWireSource* source, struct spa_ringbuffer* ring,
+                char* mem, uint32_t size, int efd)
+  : OS::Thread(), m_source(source), m_ring(ring), m_mem(mem)
+  , m_size(size), m_efd(efd) { }
   virtual ~PipeWireDrain() override
   {
     if (is_running())
@@ -96,9 +118,12 @@ public:
   bool waitFinished() { return OS::Thread::wait_thread((unsigned)-1); }
 private:
   void* process() override;
-  void drainAvailable(char* buf, int bite, int channels);
+  int drainAvailable(char* buf, int bite, int channels);
   PipeWireSource* m_source;
-  PipeWireRuntime* m_rt;
+  struct spa_ringbuffer* m_ring;
+  char* m_mem;
+  uint32_t m_size;
+  int m_efd;
 };
 
 static const struct pw_stream_events stream_events = {
@@ -134,41 +159,89 @@ static std::string env_or(const char* key, const std::string& fallback)
   return fallback;
 }
 
-// RT-safe: copy PCM into the lock-free ring, drop newest on overflow.
-static void ring_write(PipeWireRuntime* rt, const char* data, uint32_t len)
+static int64_t drain_mono_ms()
 {
-  if (len == 0 || len >= PW_RING_SIZE)
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// RT-safe: copy PCM into a lock-free ring, drop newest on overflow.
+static void ring_feed(struct spa_ringbuffer* ring, char* mem, uint32_t size,
+                      int efd, std::atomic<unsigned>* dropped,
+                      const char* data, uint32_t len)
+{
+  if (len == 0 || len >= size)
     return;
   uint32_t idx = 0;
-  int32_t fill = spa_ringbuffer_get_write_index(&rt->ring, &idx);
-  uint32_t avail = (uint32_t)PW_RING_SIZE - (uint32_t)fill;
+  int32_t fill = spa_ringbuffer_get_write_index(ring, &idx);
+  uint32_t avail = size - (uint32_t)fill;
   if (len > avail)
   {
-    unsigned d = rt->dropped.fetch_add(1) + 1;
-    if ((d % 500) == 1)
-      DBG(DBG_WARN, "PipeWire: ring overrun, dropped %u chunks\n", d);
+    if (dropped)
+    {
+      unsigned d = dropped->fetch_add(1) + 1;
+      if ((d % 500) == 1)
+        DBG(DBG_WARN, "PipeWire: ring overrun, dropped %u chunks\n", d);
+    }
     return;
   }
-  spa_ringbuffer_write_data(&rt->ring, rt->ringmem, PW_RING_SIZE,
-                            idx & (PW_RING_SIZE - 1), data, len);
-  spa_ringbuffer_write_update(&rt->ring, idx + len);
-  uint64_t one = 1;
-  (void)write(rt->efd, &one, sizeof(one)); // EFD_NONBLOCK: never blocks
+  spa_ringbuffer_write_data(ring, mem, size, idx & (size - 1), data, len);
+  spa_ringbuffer_write_update(ring, idx + len);
+  if (efd >= 0)
+  {
+    uint64_t one = 1;
+    (void)write(efd, &one, sizeof(one)); // EFD_NONBLOCK: never blocks
+  }
 }
 
-}
-
-PipeWireSource::PipeWireSource(const std::string& name, const std::string& target)
-: AudioSource()
-, m_name(name)
-, m_target(target)
-, m_format()
-, m_output(nullptr)
-, m_blankKiller(&PCMBlankKillerS16LE)
-, m_p(nullptr)
-, m_drain(nullptr)
+static void ring_write(PipeWireRuntime* rt, const char* data, uint32_t len)
 {
-  // Fixed low-latency friendly format: S16LE 48k stereo. PipeWire resamples/converts.
+  ring_feed(&rt->ring, rt->ringmem, PW_RING_SIZE, rt->efd, &rt->dropped,
+            data, len);
+}
+
+// Claim a free virtual-sink tap (spinlock only around find-and-claim).
+static int tap_attach(PipeWireRuntime* rt)
+{
+  int idx = -1;
+  while (rt->tapLock.test_and_set(std::memory_order_acquire)) { }
+  for (int i = 0; i < PW_MAX_TAPS; ++i)
+  {
+    if (!rt->taps[i].active.load(std::memory_order_relaxed))
+    {
+      idx = i;
+      break;
+    }
+  }
+  if (idx >= 0)
+  {
+    // Reset tap indices while inactive (RT skips inactive taps, and tap
+    // memory outlives sessions, so this is race-free).
+    spa_ringbuffer_init(&rt->taps[idx].ring);
+    rt->taps[idx].active.store(true, std::memory_order_release);
+  }
+  rt->tapLock.clear(std::memory_order_release);
+  return idx;
+}
+
+static void tap_release(PipeWireRuntime* rt, int idx)
+{
+  if (idx < 0 || idx >= PW_MAX_TAPS)
+    return;
+  // Tap memory is sink-owned and outlives sessions, so the RT callback
+  // can never touch freed memory; release is a plain flag store.
+  rt->taps[idx].active.store(false, std::memory_order_release);
+  if (rt->taps[idx].efd >= 0)
+  {
+    uint64_t one = 1;
+    (void)write(rt->taps[idx].efd, &one, sizeof(one));
+  }
+}
+
+static AudioFormat defaultFormat()
+{
+  AudioFormat fmt;
   int rate = PW_DEFAULT_RATE;
   int channels = PW_DEFAULT_CHANNELS;
   const char* er = std::getenv("NOSON_PW_RATE");
@@ -177,15 +250,50 @@ PipeWireSource::PipeWireSource(const std::string& name, const std::string& targe
     rate = atoi(er);
   if (ec && atoi(ec) > 0 && atoi(ec) <= 8)
     channels = atoi(ec);
-  m_format.byteOrder = AudioFormat::LittleEndian;
-  m_format.sampleType = AudioFormat::SignedInt;
-  m_format.sampleSize = 16;
-  m_format.sampleBytes = 0;
-  m_format.sampleRate = (uint32_t)rate;
-  m_format.channelCount = (uint8_t)channels;
-  m_format.codec = "audio/pcm";
+  // Fixed low-latency friendly format: S16LE 48k stereo. PipeWire resamples/converts.
+  fmt.byteOrder = AudioFormat::LittleEndian;
+  fmt.sampleType = AudioFormat::SignedInt;
+  fmt.sampleSize = 16;
+  fmt.sampleBytes = 0;
+  fmt.sampleRate = (uint32_t)rate;
+  fmt.channelCount = (uint8_t)channels;
+  fmt.codec = "audio/pcm";
+  return fmt;
+}
+
+}
+
+PipeWireSource::PipeWireSource(const std::string& name, const std::string& target)
+: AudioSource()
+, m_name(name)
+, m_target(target)
+, m_format(defaultFormat())
+, m_output(nullptr)
+, m_blankKiller(&PCMBlankKillerS16LE)
+, m_ownsRt(true)
+, m_tapIdx(-1)
+, m_p(nullptr)
+, m_drain(nullptr)
+, m_rt(nullptr)
+{
   if (m_target.empty())
     m_target = env_or("NOSON_PW_TARGET", "");
+}
+
+PipeWireSource::PipeWireSource(PipeWireRuntime* sharedRt, int tapIdx,
+                               const AudioFormat& format)
+: AudioSource()
+, m_name("noson-tap")
+, m_target()
+, m_format(format)
+, m_output(nullptr)
+, m_blankKiller(&PCMBlankKillerS16LE)
+, m_ownsRt(false)
+, m_tapIdx(tapIdx)
+, m_p(nullptr)
+, m_drain(nullptr)
+, m_rt(sharedRt)
+{
 }
 
 PipeWireSource::~PipeWireSource()
@@ -214,55 +322,92 @@ bool PipeWireSource::IsAvailable()
 
 void PipeWireSource::play(OutputStream* out)
 {
-  if (m_p)
+  if (m_drain || m_p)
     stop();
   m_output = out;
-  PipeWireRuntime* rt = new PipeWireRuntime();
-  memset(rt, 0, sizeof(*rt));
-  rt->source = this;
-  rt->negotiated.store(false);
-  rt->streaming.store(false);
-  rt->dropped.store(0);
-  rt->ringmem = new char[PW_RING_SIZE];
-  spa_ringbuffer_init(&rt->ring);
-  rt->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  if (rt->efd < 0)
+  if (m_ownsRt)
   {
-    DBG(DBG_ERROR, "PipeWire: eventfd failed\n");
-    delete[] rt->ringmem;
-    delete rt;
-    m_output = nullptr;
-    return;
+    PipeWireRuntime* rt = new PipeWireRuntime();
+    memset(rt, 0, sizeof(*rt));
+    rt->source = this;
+    rt->sinkNode = false;
+    rt->negotiated.store(false);
+    rt->streaming.store(false);
+    rt->dropped.store(0);
+    rt->tapLock.clear();
+    rt->ringmem = new char[PW_RING_SIZE];
+    spa_ringbuffer_init(&rt->ring);
+    rt->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (rt->efd < 0)
+    {
+      DBG(DBG_ERROR, "PipeWire: eventfd failed\n");
+      delete[] rt->ringmem;
+      delete rt;
+      m_output = nullptr;
+      return;
+    }
+    m_rt = rt;
+    m_p = new PipeWireLoop(m_name, m_format, m_target, false, "", rt);
+    m_drain = new PipeWireDrain(this, &rt->ring, rt->ringmem,
+                                PW_RING_SIZE, rt->efd);
+    m_p->start();
+    m_drain->start();
+    // Wait briefly for format negotiation (max 5s). Audio accumulates
+    // in the ring meanwhile; nothing is lost.
+    for (int i = 0; i < 50 && !rt->negotiated.load(); ++i)
+      usleep(100 * 1000);
   }
-  m_rt = rt;
-  m_p = new PipeWireLoop(this, rt);
-  m_drain = new PipeWireDrain(this, rt);
-  m_p->start();
-  m_drain->start();
-  // Wait briefly for format negotiation (max 5s). Audio accumulates
-  // in the ring meanwhile; nothing is lost.
-  for (int i = 0; i < 50 && !rt->negotiated.load(); ++i)
-    usleep(100 * 1000);
+  else
+  {
+    // Attach mode: feed comes from a virtual-sink tap owned by the sink.
+    if (!m_rt || m_tapIdx < 0 || m_tapIdx >= PW_MAX_TAPS)
+      return;
+    PipeWireTap* tap = &m_rt->taps[m_tapIdx];
+    m_drain = new PipeWireDrain(this, &tap->ring, tap->mem,
+                                PW_TAP_RING_SIZE, tap->efd);
+    m_drain->start();
+  }
 }
 
 void PipeWireSource::stop()
 {
-  if (!m_p)
+  if (!m_drain && !m_p)
     return;
-  // Wake the drain first so it can't block forever in read()
-  m_drain->requestInterruption();
-  if (m_rt && m_rt->efd >= 0)
+  int feedEfd = -1;
+  if (m_drain)
   {
-    uint64_t one = 1;
-    (void)write(m_rt->efd, &one, sizeof(one));
+    // Wake the drain first so it can't block forever in read()
+    m_drain->requestInterruption();
+    if (m_ownsRt)
+      feedEfd = (m_rt && m_rt->efd >= 0) ? m_rt->efd : -1;
+    else if (m_tapIdx >= 0 && m_rt)
+      feedEfd = m_rt->taps[m_tapIdx].efd;
+    if (feedEfd >= 0)
+    {
+      uint64_t one = 1;
+      (void)write(feedEfd, &one, sizeof(one));
+    }
   }
   // Quit the pipewire main loop from this thread (thread-safe)
-  if (m_rt && m_rt->loop)
-    pw_main_loop_quit(m_rt->loop);
-  m_p->requestInterruption();
-  m_drain->waitFinished();
-  m_p->waitFinished();
-  if (m_rt)
+  if (m_p)
+  {
+    if (m_rt && m_rt->loop)
+      pw_main_loop_quit(m_rt->loop);
+    m_p->requestInterruption();
+  }
+  if (m_drain)
+  {
+    m_drain->waitFinished();
+    delete m_drain;
+    m_drain = nullptr;
+  }
+  if (m_p)
+  {
+    m_p->waitFinished();
+    delete m_p;
+    m_p = nullptr;
+  }
+  if (m_ownsRt && m_rt)
   {
     if (m_rt->efd >= 0)
       close(m_rt->efd);
@@ -272,11 +417,120 @@ void PipeWireSource::stop()
     delete m_rt;
     m_rt = nullptr;
   }
-  delete m_drain;
-  m_drain = nullptr;
-  delete m_p;
-  m_p = nullptr;
+  else if (!m_ownsRt && m_rt && m_tapIdx >= 0)
+  {
+    tap_release(m_rt, m_tapIdx);
+    m_tapIdx = -1;
+    m_rt = nullptr;
+  }
   m_output = nullptr;
+}
+
+PipeWireVirtualSink::PipeWireVirtualSink(const std::string& nodeName,
+                                         const std::string& description)
+: m_name(nodeName.empty() ? "noson" : nodeName)
+, m_desc(description.empty() ? "Sonos" : description)
+, m_format(defaultFormat())
+, m_rt(nullptr)
+, m_loop(nullptr)
+{
+}
+
+PipeWireVirtualSink::~PipeWireVirtualSink()
+{
+  stop();
+}
+
+bool PipeWireVirtualSink::start()
+{
+  if (m_loop)
+    return true;
+  if (!PipeWireSource::IsAvailable())
+    return false;
+  PipeWireRuntime* rt = new PipeWireRuntime();
+  memset(rt, 0, sizeof(*rt));
+  rt->source = nullptr;
+  rt->sinkNode = true;
+  rt->negotiated.store(false);
+  rt->streaming.store(false);
+  rt->dropped.store(0);
+  rt->tapLock.clear();
+  for (int i = 0; i < PW_MAX_TAPS; ++i)
+  {
+    rt->taps[i].active.store(false);
+    spa_ringbuffer_init(&rt->taps[i].ring);
+    rt->taps[i].mem = new char[PW_TAP_RING_SIZE];
+    rt->taps[i].efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (rt->taps[i].efd < 0)
+    {
+      for (int j = 0; j <= i; ++j)
+      {
+        delete[] rt->taps[j].mem;
+        if (rt->taps[j].efd >= 0)
+          close(rt->taps[j].efd);
+      }
+      delete rt;
+      return false;
+    }
+  }
+  m_rt = rt;
+  m_loop = new PipeWireLoop(m_name, m_format, "", true, m_desc, rt);
+  m_loop->start();
+  for (int i = 0; i < 50 && !rt->negotiated.load(); ++i)
+    usleep(100 * 1000);
+  if (!m_loop->isRunning())
+  {
+    stop();
+    return false;
+  }
+  DBG(DBG_INFO, "PipeWire: virtual sink '%s' (%s) ready\n",
+      m_name.c_str(), m_desc.c_str());
+  return true;
+}
+
+void PipeWireVirtualSink::stop()
+{
+  if (!m_loop)
+    return;
+  if (m_rt && m_rt->loop)
+    pw_main_loop_quit(m_rt->loop);
+  m_loop->requestInterruption();
+  m_loop->waitFinished();
+  delete m_loop;
+  m_loop = nullptr;
+  if (m_rt)
+  {
+    for (int i = 0; i < PW_MAX_TAPS; ++i)
+    {
+      delete[] m_rt->taps[i].mem;
+      if (m_rt->taps[i].efd >= 0)
+        close(m_rt->taps[i].efd);
+    }
+    delete m_rt;
+    m_rt = nullptr;
+  }
+}
+
+bool PipeWireVirtualSink::isRunning() const
+{
+  return m_loop && m_loop->isRunning();
+}
+
+bool PipeWireVirtualSink::hasFreeTap() const
+{
+  if (!isRunning() || !m_rt)
+    return false;
+  for (int i = 0; i < PW_MAX_TAPS; ++i)
+    if (!m_rt->taps[i].active.load(std::memory_order_acquire))
+      return true;
+  return false;
+}
+
+int PipeWireVirtualSink::attachTap()
+{
+  if (!isRunning() || !m_rt)
+    return -1;
+  return tap_attach(m_rt);
 }
 
 void* PipeWireLoop::process()
@@ -284,12 +538,17 @@ void* PipeWireLoop::process()
   pw_global_init();
   PipeWireRuntime* rt = m_rt;
 
-  const std::string target = m_source->m_target.empty()
-      ? env_or("NOSON_PW_TARGET", "") : m_source->m_target;
+  std::string target = m_target;
+  if (!m_sinkMode && target.empty())
+    target = env_or("NOSON_PW_TARGET", "");
   const std::string latency = env_or("NOSON_PW_LATENCY", PW_DEFAULT_LATENCY);
-  std::string captureSink = env_or("NOSON_PW_CAPTURE_SINK", "");
-  if (captureSink.empty() && target.empty())
-    captureSink = "true"; // default: capture default sink monitor (desktop output)
+  std::string captureSink;
+  if (!m_sinkMode)
+  {
+    captureSink = env_or("NOSON_PW_CAPTURE_SINK", "");
+    if (captureSink.empty() && target.empty())
+      captureSink = "true"; // default: capture default sink monitor (desktop output)
+  }
 
   rt->loop = pw_main_loop_new(nullptr);
   if (!rt->loop)
@@ -298,21 +557,41 @@ void* PipeWireLoop::process()
     return nullptr;
   }
 
-  struct pw_properties* props = pw_properties_new(
-      PW_KEY_MEDIA_TYPE, "Audio",
-      PW_KEY_MEDIA_CATEGORY, "Capture",
-      PW_KEY_MEDIA_ROLE, "Music",
-      PW_KEY_NODE_LATENCY, latency.c_str(),
-      PW_KEY_NODE_NAME, m_source->m_name.c_str(),
-      nullptr);
-  if (!target.empty())
-    pw_properties_set(props, PW_KEY_TARGET_OBJECT, target.c_str());
-  if (!captureSink.empty())
-    pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, captureSink.c_str());
+  struct pw_properties* props;
+  if (m_sinkMode)
+  {
+    // Virtual sink: shows up in the OS sound settings as a regular
+    // output device. Apps playing to it feed our taps; nothing is
+    // audible locally and nothing needs manual wiring.
+    props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Playback",
+        PW_KEY_MEDIA_ROLE, "Music",
+        PW_KEY_MEDIA_CLASS, "Audio/Sink",
+        PW_KEY_NODE_NAME, m_name.c_str(),
+        PW_KEY_NODE_DESCRIPTION, m_sinkDesc.c_str(),
+        PW_KEY_NODE_LATENCY, latency.c_str(),
+        PW_KEY_NODE_VIRTUAL, "true",
+        nullptr);
+  }
+  else
+  {
+    props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Capture",
+        PW_KEY_MEDIA_ROLE, "Music",
+        PW_KEY_NODE_LATENCY, latency.c_str(),
+        PW_KEY_NODE_NAME, m_name.c_str(),
+        nullptr);
+    if (!target.empty())
+      pw_properties_set(props, PW_KEY_TARGET_OBJECT, target.c_str());
+    if (!captureSink.empty())
+      pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, captureSink.c_str());
+  }
 
   rt->stream = pw_stream_new_simple(
       pw_main_loop_get_loop(rt->loop),
-      m_source->m_name.c_str(),
+      m_name.c_str(),
       props,
       &stream_events,
       rt);
@@ -328,8 +607,8 @@ void* PipeWireLoop::process()
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
   struct spa_audio_info_raw raw;
   raw.format = SPA_AUDIO_FORMAT_S16_LE;
-  raw.rate = m_source->m_format.sampleRate;
-  raw.channels = m_source->m_format.channelCount;
+  raw.rate = m_format.sampleRate;
+  raw.channels = m_format.channelCount;
   raw.flags = 0;
   raw.position[0] = SPA_AUDIO_CHANNEL_FL;
   if (raw.channels > 1)
@@ -343,7 +622,7 @@ void* PipeWireLoop::process()
   int res = pw_stream_connect(rt->stream,
       PW_DIRECTION_INPUT,
       PW_ID_ANY,
-      (pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT |
+      (pw_stream_flags)((m_sinkMode ? 0 : PW_STREAM_FLAG_AUTOCONNECT) |
                         PW_STREAM_FLAG_MAP_BUFFERS |
                         PW_STREAM_FLAG_RT_PROCESS),
       params, 1);
@@ -357,9 +636,10 @@ void* PipeWireLoop::process()
     return nullptr;
   }
 
-  DBG(DBG_INFO, "PipeWire: capturing target='%s' latency=%s rate=%u ch=%u\n",
-      target.empty() ? "<default>" : target.c_str(), latency.c_str(),
-      m_source->m_format.sampleRate, m_source->m_format.channelCount);
+  DBG(DBG_INFO, "PipeWire: %s target='%s' latency=%s rate=%u ch=%u\n",
+      m_sinkMode ? "sink node" : "capturing",
+      m_sinkMode ? m_name.c_str() : (target.empty() ? "<default>" : target.c_str()),
+      latency.c_str(), m_format.sampleRate, m_format.channelCount);
 
   rt->streaming.store(true);
   pw_main_loop_run(rt->loop);
@@ -386,24 +666,40 @@ void* PipeWireDrain::process()
   const int bite = bytesPerFrame * PW_DRAIN_FRAMES;
   char* buf = new char[bite];
   const int channels = m_source->m_format.channelCount;
+  int64_t nextSilence = 0; // paced silence-fill deadline (mono ms)
   while (!OS::Thread::is_stopped())
   {
     uint64_t cnt = 0;
-    ssize_t r = read(m_rt->efd, &cnt, sizeof(cnt));
+    ssize_t r = read(m_efd, &cnt, sizeof(cnt));
     if (r <= 0)
     {
       if (errno == EINTR)
         continue;
-      if (errno == EAGAIN)
-      {
-        usleep(1000);
-        continue;
-      }
-      break; // efd closed or stopped
+      if (errno != EAGAIN)
+        break; // efd closed or stopped
+      // No signal: ring may still hold data (coalesced wakeups).
     }
     if (OS::Thread::is_stopped())
       break;
-    drainAvailable(buf, bite, channels);
+    int produced = drainAvailable(buf, bite, channels);
+    if (produced == 0)
+    {
+      // Ring dry (e.g. virtual sink with no players yet): emit paced
+      // silence like a PulseAudio monitor does, so downstream (HTTP)
+      // never starves and the speaker stays in steady PLAYING.
+      int64_t now = drain_mono_ms();
+      if (now >= nextSilence)
+      {
+        memset(buf, 0, bite);
+        m_source->m_blankKiller(buf, channels, PW_DRAIN_FRAMES / 4);
+        OutputStream* out = m_source->m_output;
+        if (out && out->Write(buf, bite) != bite)
+          break;
+        nextSilence = now + (1000 * PW_DRAIN_FRAMES) / m_source->m_format.sampleRate;
+      }
+      else
+        usleep(1000);
+    }
   }
   // flush whatever remains (partial bite allowed at shutdown)
   drainAvailable(buf, bite, channels);
@@ -411,16 +707,17 @@ void* PipeWireDrain::process()
   return nullptr;
 }
 
-void PipeWireDrain::drainAvailable(char* buf, int bite, int channels)
+int PipeWireDrain::drainAvailable(char* buf, int bite, int channels)
 {
   OutputStream* out = m_source->m_output;
-  if (!out)
-    return;
+  if (!out || m_efd < 0)
+    return 0;
   const int bpf = channels * 2; // S16LE bytes per frame
+  int produced = 0;
   for (;;)
   {
     uint32_t idx = 0;
-    int32_t avail = spa_ringbuffer_get_read_index(&m_rt->ring, &idx);
+    int32_t avail = spa_ringbuffer_get_read_index(m_ring, &idx);
     if (avail <= 0)
       break;
     // process full bites; a partial tail waits for the next wakeup,
@@ -431,9 +728,9 @@ void PipeWireDrain::drainAvailable(char* buf, int bite, int channels)
     len -= len % bpf; // whole frames only
     if (len <= 0)
       break; // cannot make progress on a sub-frame tail
-    spa_ringbuffer_read_data(&m_rt->ring, m_rt->ringmem, PW_RING_SIZE,
-                             idx & (PW_RING_SIZE - 1), buf, (uint32_t)len);
-    spa_ringbuffer_read_update(&m_rt->ring, idx + len);
+    spa_ringbuffer_read_data(m_ring, m_mem, m_size,
+                             idx & (m_size - 1), buf, (uint32_t)len);
+    spa_ringbuffer_read_update(m_ring, idx + len);
     if (m_source->m_mute)
       memset(buf, 0, len);
     else if (len / bpf >= 2)
@@ -445,9 +742,11 @@ void PipeWireDrain::drainAvailable(char* buf, int bite, int channels)
       DBG(DBG_ERROR, "PipeWire: write() failed\n");
       break;
     }
+    produced += len;
     if (OS::Thread::is_stopped())
       break;
   }
+  return produced;
 }
 
 void NSROOT::on_param_changed(void* userdata, uint32_t id, const struct spa_pod* param)
@@ -484,7 +783,20 @@ void NSROOT::on_process(void* userdata)
     uint32_t fmt = rt->format.info.raw.format;
     if (fmt == SPA_AUDIO_FORMAT_S16_LE || fmt == SPA_AUDIO_FORMAT_S16)
     {
-      ring_write(rt, static_cast<const char*>(data), size);
+      if (rt->sinkNode)
+      {
+        // Virtual sink: tee to every active tap (apps must never stall).
+        for (int t = 0; t < PW_MAX_TAPS; ++t)
+        {
+          PipeWireTap* tap = &rt->taps[t];
+          if (!tap->active.load(std::memory_order_acquire))
+            continue;
+          ring_feed(&tap->ring, tap->mem, PW_TAP_RING_SIZE, tap->efd,
+                    nullptr, static_cast<const char*>(data), size);
+        }
+      }
+      else
+        ring_write(rt, static_cast<const char*>(data), size);
     }
     else if (fmt == SPA_AUDIO_FORMAT_F32_LE || fmt == SPA_AUDIO_FORMAT_F32)
     {
@@ -508,7 +820,20 @@ void NSROOT::on_process(void* userdata)
             if (v < -1.0f) v = -1.0f;
             tmp[i] = (int16_t)(v * 32767.0f);
           }
-          ring_write(rt, reinterpret_cast<const char*>(tmp), n * ch * 2);
+          const uint32_t bytes = n * ch * 2;
+          if (rt->sinkNode)
+          {
+            for (int t = 0; t < PW_MAX_TAPS; ++t)
+            {
+              PipeWireTap* tap = &rt->taps[t];
+              if (!tap->active.load(std::memory_order_acquire))
+                continue;
+              ring_feed(&tap->ring, tap->mem, PW_TAP_RING_SIZE, tap->efd,
+                        nullptr, reinterpret_cast<const char*>(tmp), bytes);
+            }
+          }
+          else
+            ring_write(rt, reinterpret_cast<const char*>(tmp), bytes);
           done += n;
         }
       }

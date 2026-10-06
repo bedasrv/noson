@@ -28,11 +28,13 @@
 namespace NSROOT
 {
 
+class PipeWireVirtualSink;
+
 class PulseStreamer : public RequestBroker
 {
 public:
   PulseStreamer(RequestBroker * imageService = nullptr);
-  ~PulseStreamer() override { }
+  ~PulseStreamer() override;
   virtual bool Initialize() override;
   virtual bool HandleRequest(handle * handle) override;
 
@@ -52,12 +54,15 @@ private:
   Locked<unsigned> m_sinkIndex;
   // count current running playback
   Locked<int> m_playbackCount;
+  // persistent PipeWire virtual sink ("Sonos" output device), if enabled
+  PipeWireVirtualSink* m_pwSink;
 
   std::string GetPASink();
   void FreePASink();
   void streamSink(handle * handle);
   void streamSinkPW(handle * handle);
   bool UsePipeWire();
+  bool EnsureVirtualSink();
 };
 
 }

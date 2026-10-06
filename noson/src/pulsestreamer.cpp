@@ -96,6 +96,7 @@ PulseStreamer::PulseStreamer(RequestBroker * imageService /*= nullptr*/)
 , m_resources()
 , m_sinkIndex(PA_INVALID_INDEX)
 , m_playbackCount(0)
+, m_pwSink(nullptr)
 {
   // delegate image download to imageService
   ResourcePtr img(nullptr);
@@ -125,6 +126,43 @@ bool PulseStreamer::Initialize()
 #ifdef HAVE_PIPEWIRE
   // PipeWire needs no dlopen init; availability is checked per-stream
   // so we can always succeed here when compiled with PipeWire support.
+  // The virtual sink is created below in streamSinkPW on first use...
+  return true;
+#else
+  return false;
+#endif
+}
+
+PulseStreamer::~PulseStreamer()
+{
+#ifdef HAVE_PIPEWIRE
+  delete m_pwSink;
+  m_pwSink = nullptr;
+#endif
+}
+
+// Persistent virtual sink ("Sonos" output device in sound settings).
+// Created on first stream so a missing/broken PipeWire never blocks init.
+bool PulseStreamer::EnsureVirtualSink()
+{
+#ifdef HAVE_PIPEWIRE
+  if (m_pwSink)
+    return m_pwSink->isRunning();
+  const char* dis = std::getenv("NOSON_VIRTUAL_SINK");
+  if (dis && strcmp(dis, "0") == 0)
+    return false;
+  if (!PipeWireSource::IsAvailable())
+    return false;
+  const char* nm = std::getenv("NOSON_SINK_NAME");
+  const char* ds = std::getenv("NOSON_SINK_DESC");
+  m_pwSink = new PipeWireVirtualSink(nm ? nm : "", ds ? ds : "");
+  if (!m_pwSink->start())
+  {
+    DBG(DBG_ERROR, "%s: virtual sink unavailable\n", __FUNCTION__);
+    delete m_pwSink;
+    m_pwSink = nullptr;
+    return false;
+  }
   return true;
 #else
   return false;
@@ -379,17 +417,22 @@ void PulseStreamer::streamSinkPW(handle * handle)
     return;
   }
 
-  // Target selection: NOSON_PW_TARGET env or explicit device, else default
-  // sink monitor (see PipeWireSource). No null-sink is created on this path.
-  // NOSON_TEST_TONE=chirp sends an in-process test chirp instead of audio
-  // hardware, with per-chirp send timestamps for latency measurement.
+  // Target selection: explicit NOSON_PW_TARGET wins (e.g. raw mic);
+  // otherwise the persistent virtual sink ("Sonos" output device);
+  // otherwise the default sink monitor. No PulseAudio null-sink is
+  // created on this path. NOSON_TEST_TONE=chirp sends an in-process
+  // test chirp instead of audio hardware, with per-chirp send
+  // timestamps for latency measurement.
   const char* envTarget = std::getenv("NOSON_PW_TARGET");
   std::string target = envTarget ? envTarget : "";
   const char* testTone = std::getenv("NOSON_TEST_TONE");
   const bool useChirp = testTone && strcmp(testTone, "chirp") == 0;
+  const bool useSink = !useChirp && target.empty() && EnsureVirtualSink()
+      && m_pwSink->hasFreeTap();
   DBG(DBG_INFO, "%s: %s target='%s'\n", __FUNCTION__,
-      useChirp ? "chirp test tone" : "pipewire capture",
-      useChirp ? "<internal>" : (target.empty() ? "<default sink monitor>" : target.c_str()));
+      useChirp ? "chirp test tone" : (useSink ? "virtual sink" : "pipewire capture"),
+      useChirp ? "<internal>" : (target.empty() && useSink ? "<sonos sink>" :
+        (target.empty() ? "<default sink monitor>" : target.c_str())));
 
   AudioSource* audioSource = nullptr;
   PipeWireSource* pwSource = nullptr;
@@ -398,6 +441,21 @@ void PulseStreamer::streamSinkPW(handle * handle)
   {
     chirpSource = new ChirpSource(PA_CLIENT_NAME);
     audioSource = chirpSource;
+  }
+  else if (useSink)
+  {
+    int tap = m_pwSink->attachTap();
+    if (tap < 0)
+    {
+      DBG(DBG_ERROR, "%s: no free virtual-sink tap\n", __FUNCTION__);
+      TraceResponseStatus(503);
+      reply.CloseReply(WS_STATUS_503_Service_Unavailable);
+      *m_playbackCount.GetExclusive() -= 1;
+      return;
+    }
+    pwSource = new PipeWireSource(m_pwSink->runtime(), tap,
+                                  m_pwSink->format());
+    audioSource = pwSource;
   }
   else
   {
