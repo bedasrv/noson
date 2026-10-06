@@ -17,6 +17,7 @@
 #include "private/os/threads/timeout.h"
 
 #include <pipewire/pipewire.h>
+#include <pipewire/loop.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/utils/ringbuffer.h>
 #include <spa/utils/result.h>
@@ -240,9 +241,20 @@ static void tap_release(PipeWireRuntime* rt, int idx)
   }
 }
 
-static AudioFormat defaultFormat()
+// Graph driver tick (loop thread): when our sink node is elected driver
+// (i.e. no hardware runs), pump the graph so players linked to the node
+// get scheduled even with everything else suspended. Thread-safe: the
+// resulting process() runs in the RT thread as usual.
+static void driver_tick(void* userdata, uint64_t expirations)
 {
-  AudioFormat fmt;
+  (void)expirations;
+  PipeWireRuntime* rt = static_cast<PipeWireRuntime*>(userdata);
+  if (rt->stream && pw_stream_is_driving(rt->stream))
+    pw_stream_trigger_process(rt->stream);
+}
+
+static AudioFormat defaultFormat()
+{  AudioFormat fmt;
   int rate = PW_DEFAULT_RATE;
   int channels = PW_DEFAULT_CHANNELS;
   const char* er = std::getenv("NOSON_PW_RATE");
@@ -573,6 +585,7 @@ void* PipeWireLoop::process()
         PW_KEY_NODE_DESCRIPTION, m_sinkDesc.c_str(),
         PW_KEY_NODE_LATENCY, latency.c_str(),
         PW_KEY_NODE_VIRTUAL, "true",
+        PW_KEY_NODE_DRIVER, "true",
         nullptr);
   }
   else
@@ -623,7 +636,7 @@ void* PipeWireLoop::process()
   int res = pw_stream_connect(rt->stream,
       PW_DIRECTION_INPUT,
       PW_ID_ANY,
-      (pw_stream_flags)((m_sinkMode ? 0 : PW_STREAM_FLAG_AUTOCONNECT) |
+      (pw_stream_flags)((m_sinkMode ? (PW_STREAM_FLAG_DRIVER) : PW_STREAM_FLAG_AUTOCONNECT) |
                         PW_STREAM_FLAG_MAP_BUFFERS |
                         PW_STREAM_FLAG_RT_PROCESS),
       params, 1);
@@ -637,6 +650,23 @@ void* PipeWireLoop::process()
     return nullptr;
   }
 
+  // Sink mode drives its own graph cycles (5ms) so linked players get
+  // scheduled even when all hardware is suspended. When real hardware
+  // runs it wins driver election and we just follow.
+  struct spa_source* timer = nullptr;
+  struct pw_loop* ploop = nullptr;
+  if (m_sinkMode)
+  {
+    ploop = pw_main_loop_get_loop(rt->loop);
+    timer = pw_loop_add_timer(ploop, driver_tick, rt);
+    if (timer)
+    {
+      struct timespec val = {0, 5000000};
+      struct timespec iv = {0, 5000000};
+      pw_loop_update_timer(ploop, timer, &val, &iv, false);
+    }
+  }
+
   DBG(DBG_INFO, "PipeWire: %s target='%s' latency=%s rate=%u ch=%u\n",
       m_sinkMode ? "sink node" : "capturing",
       m_sinkMode ? m_name.c_str() : (target.empty() ? "<default>" : target.c_str()),
@@ -646,6 +676,8 @@ void* PipeWireLoop::process()
   pw_main_loop_run(rt->loop);
   rt->streaming.store(false);
 
+  if (timer && ploop)
+    pw_loop_destroy_source(ploop, timer);
   if (rt->stream)
   {
     pw_stream_destroy(rt->stream);
