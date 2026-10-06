@@ -60,6 +60,7 @@ struct PipeWireRuntime
   struct spa_audio_info format;
   std::atomic<bool> negotiated;
   std::atomic<bool> streaming;
+  std::atomic<uint64_t> buffers;
   PipeWireSource* source;
   bool sinkNode;
   // lock-free PCM handoff (RT producer, drain consumer)
@@ -780,6 +781,10 @@ void NSROOT::on_process(void* userdata)
       ? buf->datas[0].chunk->size : 0;
   if (data && size && rt->negotiated.load())
   {
+    // First-buffer marker (fires once): proves the graph delivers audio.
+    if (rt->buffers.fetch_add(1) == 0)
+      DBG(DBG_INFO, "PipeWire: first audio buffer, %u bytes%s\n", size,
+          rt->sinkNode ? " (sink)" : "");
     uint32_t fmt = rt->format.info.raw.format;
     if (fmt == SPA_AUDIO_FORMAT_S16_LE || fmt == SPA_AUDIO_FORMAT_S16)
     {
