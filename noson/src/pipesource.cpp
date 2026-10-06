@@ -82,11 +82,6 @@ struct PipeWireRuntime
   std::atomic<float> nodeVolume;
   std::atomic<bool> nodeMute;
   int vefd; // signalled on every Props volume/mute change
-  // production-rate tracking for the adaptive driver tick
-  std::atomic<uint64_t> producedFrames; // RT producer increments
-  bool ticking; // loop thread only
-  struct timespec rateWall; // loop thread only
-  uint64_t rateFrames; // loop thread only
   // node-proxy Props subscription (sink mode): our stream's param_changed
   // does not deliver Props, so we subscribe on our own node directly.
   struct pw_registry* registry;
@@ -440,42 +435,13 @@ static void ensure_props_subscription(PipeWireRuntime* rt)
   DBG(DBG_INFO, "PipeWire: subscribed node %u Props (res=%d)\n", nid, res);
 }
 
-// Adaptive driver state (loop thread only): our tick must pump the graph
-// iff nothing else does. Hardware cycles + our ticks together pumped
-// ~2.1x realtime (measured); a tick timer alone runs ~1.07x (5ms vs
-// 5.33ms quantum), so the interval below is one exact quantum and the
-// state machine keeps production at 1x either way.
-static void driver_tick(void* userdata, uint64_t expirations)
+// Subscription retry tick (loop thread, 2Hz): arms the Props listener
+// once the server assigns our node id, then disarms. Never pumps audio.
+static void sub_tick(void* userdata, uint64_t expirations)
 {
   (void)expirations;
   PipeWireRuntime* rt = static_cast<PipeWireRuntime*>(userdata);
   ensure_props_subscription(rt);
-  if (!rt->stream)
-    return;
-  struct timespec now;
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  uint64_t frames = rt->producedFrames.load(std::memory_order_relaxed);
-  long dtms = (now.tv_sec - rt->rateWall.tv_sec) * 1000 +
-      (now.tv_nsec - rt->rateWall.tv_nsec) / 1000000;
-  if (dtms >= 200)
-  {
-    // frames produced per wall ms: 48.0 == realtime at 48kHz
-    double rate = dtms > 0 ? (double)(frames - rt->rateFrames) / (double)dtms : 0.0;
-    if (rt->ticking && rate > 60.0)
-    {
-      rt->ticking = false; // something else drives; our ticks would double-pump
-      DBG(DBG_INFO, "PipeWire: driver tick off (rate %.1f f/ms)\n", rate);
-    }
-    else if (!rt->ticking && rate < 24.0)
-    {
-      rt->ticking = true; // graph stalled; we must pump it
-      DBG(DBG_INFO, "PipeWire: driver tick on (rate %.1f f/ms)\n", rate);
-    }
-    rt->rateWall = now;
-    rt->rateFrames = frames;
-  }
-  if (rt->ticking && pw_stream_is_driving(rt->stream))
-    pw_stream_trigger_process(rt->stream);
 }
 
 static AudioFormat defaultFormat()
@@ -699,10 +665,6 @@ bool PipeWireVirtualSink::start()
   rt->tapLock.clear();
   rt->nodeVolume.store(1.0f);
   rt->nodeMute.store(false);
-  rt->producedFrames.store(0);
-  rt->ticking = false; // adaptive tick proves the need before pumping
-  clock_gettime(CLOCK_MONOTONIC, &rt->rateWall);
-  rt->rateFrames = 0;
   rt->vefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   if (rt->vefd < 0)
   {
@@ -855,7 +817,6 @@ void* PipeWireLoop::process()
         PW_KEY_DEVICE_ICON_NAME, "audio-speakers",
         PW_KEY_NODE_LATENCY, latency.c_str(),
         PW_KEY_NODE_VIRTUAL, "true",
-        PW_KEY_NODE_DRIVER, "true",
         nullptr);
   }
   else
@@ -910,8 +871,7 @@ void* PipeWireLoop::process()
   int res = pw_stream_connect(rt->stream,
       PW_DIRECTION_INPUT,
       PW_ID_ANY,
-      (pw_stream_flags)((m_sinkMode ? (PW_STREAM_FLAG_DRIVER) : PW_STREAM_FLAG_AUTOCONNECT) |
-                        PW_STREAM_FLAG_MAP_BUFFERS |
+      (pw_stream_flags)(PW_STREAM_FLAG_MAP_BUFFERS |
                         PW_STREAM_FLAG_RT_PROCESS),
       params, 1);
   if (res < 0)
@@ -924,25 +884,21 @@ void* PipeWireLoop::process()
     return nullptr;
   }
 
-  // Sink mode drives its own graph cycles (5ms) so linked players get
-  // scheduled even when all hardware is suspended. When real hardware
-  // runs it wins driver election and we just follow.
-  struct spa_source* timer = nullptr;
+  // Sink-mode Props subscription retry: the node id is only valid once
+  // the server creates the node (connect is async). This timer only
+  // subscribes (never pumps the graph) and disarms itself on success.
+  struct spa_source* subtimer = nullptr;
   struct pw_loop* ploop = nullptr;
   if (m_sinkMode)
   {
     ploop = pw_main_loop_get_loop(rt->loop);
-    // One exact quantum per tick (256f @48k = 5.333ms), not 5ms flat:
-    // a fast timer alone would already run ~1.07x.
-    struct timespec tick_iv = {0, 5333333};
-    struct timespec tick_val = {0, 5333333};
-    timer = pw_loop_add_timer(ploop, driver_tick, rt);
-    if (timer)
-      pw_loop_update_timer(ploop, timer, &tick_val, &tick_iv, false);
-    // Slider tracking is set up lazily from the driver tick (node id is
-    // only valid once the server creates the node).
-    rt->registry = nullptr;
-    rt->nodeProxy = nullptr;
+    subtimer = pw_loop_add_timer(ploop, sub_tick, rt);
+    if (subtimer)
+    {
+      struct timespec val = {0, 500000000};
+      struct timespec iv = {0, 500000000};
+      pw_loop_update_timer(ploop, subtimer, &val, &iv, false);
+    }
   }
 
   DBG(DBG_INFO, "PipeWire: %s target='%s' latency=%s rate=%u ch=%u\n",
@@ -954,8 +910,8 @@ void* PipeWireLoop::process()
   pw_main_loop_run(rt->loop);
   rt->streaming.store(false);
 
-  if (timer && ploop)
-    pw_loop_destroy_source(ploop, timer);
+  if (subtimer && ploop)
+    pw_loop_destroy_source(ploop, subtimer);
   if (rt->nodeProxy)
   {
     pw_proxy_destroy(rt->nodeProxy);
@@ -1118,16 +1074,6 @@ void NSROOT::on_process(void* userdata)
       DBG(DBG_INFO, "PipeWire: first audio buffer, %u bytes%s\n", size,
           rt->sinkNode ? " (sink)" : "");
     uint32_t fmt = rt->format.info.raw.format;
-    uint32_t nch = rt->format.info.raw.channels;
-    if (nch > 0 && nch <= 8)
-    {
-      // Production-rate tracking for the adaptive driver tick (1 audio
-      // ms == 48 frames at 48kHz).
-      uint32_t bytesPerFrame = nch * ((fmt == SPA_AUDIO_FORMAT_F32_LE ||
-          fmt == SPA_AUDIO_FORMAT_F32) ? sizeof(float) : sizeof(int16_t));
-      if (bytesPerFrame)
-        rt->producedFrames.fetch_add(size / bytesPerFrame, std::memory_order_relaxed);
-    }
     if (fmt == SPA_AUDIO_FORMAT_S16_LE || fmt == SPA_AUDIO_FORMAT_S16)
     {
       if (rt->sinkNode)
